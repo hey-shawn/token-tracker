@@ -5,6 +5,8 @@
 
 ## 当前阶段
 
+**模型定价全面校准已完成（2026-08-30 10:55，未发版）**：按最新官方页更新 GPT-5.6 Sol 促销价与三档 >272K 阶梯价、Claude Mythos 5、GLM-5.1、Qwen3-Coder-Next、Doubao Seed 2.0 Code／2.1 Pro、DeepSeek V4 峰谷价、Grok 4.3／4.5／4.6 与 Build 长上下文价，并补 Gemini 3.6／3.7、GLM-5.3 等短名；Sonnet 5 的 $2/$10 已确认转为永久价，移除 9 月切价待办。模型解析新增官方 provider 前缀映射，解决 LiteLLM 仅有 `xai/`、`zai/` 等键时 bare model id 误落旧系列价。计价器现按单次请求 prompt 长度选阶梯档；Codex adapter 从 `last_token_usage` 保留逐请求时间与用量，使 DeepSeek 能按请求所在时段结算--周一至周五 UTC 01:00-04:00、06:00-10:00 为峰时，其余时段（含周末全天）为谷时，新价自 2026-08-16 16:00 UTC 生效。Codex 状态栏同步改为逐请求计价并升至 1.7。完整 pytest 与英文 dumb terminal CI 模拟均 **362 全绿**，Ruff 全过、mypy 41 个源文件 0 报错，`git diff --check` 通过。
+
 **`0.5.6` 已发布 PyPI（2026-08-25，源码与 tag 已 push）**：本版收口 Codex sidebar 注入噪声——`_CODEX_SKIP_PREFIXES` 补 `The following is the Codex agent history` / `>>> TRANSCRIPT` / `<codex_internal_context` 三个前缀（自动审批工具注入的 transcript 历史与 goal 模式内部上下文），`_hint_text` 对 `{` / `[` 开头的结构化输出直接返回空（审批 JSON 不再占「下一步」栏，CC / Kimi 同受益）。发布前完整 pytest **344 全绿**、英文 dumb terminal CI 模拟 **344 全绿**、Ruff 全过、mypy 41 个源文件 0 报错，`uv lock --check` 与 `git diff --check` 通过；真机 120h / 54 会话扫描注入残留 0 条。release commit `fb27d57` 与 annotated tag `v0.5.6` 已 push；sdist / wheel 构建与 Twine check 通过；PyPI JSON 已传播，远端 wheel SHA-256 `0d90c7de…`、sdist SHA-256 `3ac94964…` 与本地产物一致；`uvx --no-cache --from token-tracker==0.5.6` 安装后 `tt --version` 正确输出 0.5.6，用户级 `tt` 已升级。
 
 **`0.5.5` 已发布 PyPI（2026-08-25，源码与 tag 已 push）**：本版含两笔修复——① `$tt-sidebar` 兼容 Codex 新版 rollout `response_item/message`（部分会话 `event_msg/user_message` 完全缺失），并修复双写成对重复（以 event 为准去重，纯新版日志保留 response 通道）、`<recommended_plugins>` 注入混入提示词、结构化 JSON 覆盖 `next_hint` 三个真机问题；② Ghostty 分屏加前置探针 `_probe_ghostty()`，Codex 沙箱 -2741 与版本过低分开精确提示（沙箱提示以 require_escalated 重跑）。`pyproject.toml` / `uv.lock` 已同步 0.5.5；发布前完整 pytest **342 全绿**、英文 dumb terminal CI 模拟 **342 全绿**、Ruff 全过、mypy 41 个源文件 0 报错，`uv lock --check` 与 `git diff --check` 通过。release commit `a7ab053` 与 annotated tag `v0.5.5` 已 push；sdist / wheel 构建与 Twine check 通过，wheel 含新版 `ghostty_split.py` / `sidebar.py`，METADATA 版本正确；PyPI JSON 已传播，远端 wheel SHA-256 `37614ed0…`、sdist SHA-256 `78b697a3…` 与本地产物一致；`uvx --no-cache --from token-tracker==0.5.5` 安装后 `tt --version` 正确输出 0.5.5。
@@ -51,7 +53,7 @@
 
 **第三批 报表按 agent 过滤（issue #19，`124918d`）**：`--claude` / `--codex` 互斥 flag——`_extract_agent_arg` 提取、`main()` 在 `detect_agents()` 后收窄 agents 列表；显式 flag 优先级最高、会话内自动识别在其后；未装该 agent 时友好报错退出；对 `status` / `daily` / `weekly` / `monthly` / `sessions` 全部生效；补 4 用例 + README 双语。issue #19 已 gh 回复并关闭。
 
-**第四批 Sonnet 5 定价识别（`821aa72`）**：`cost.py` 补 `claude-sonnet-5` 内置价（当前为 Anthropic 官方**导入价** $2/$10/$2.50/$0.20，截止 **2026-08-31**；9-1 起将改为标准价 $3/$15，须再切一版，除非届时 litellm 在线表已收录取代），`_FAMILY_FALLBACK` 里 `claude-sonnet` 前缀兜底指向 sonnet-5（承接未来 sonnet 变体）；`format.py` 加短名「Sonnet 5」；补 3 用例。来源：https://platform.claude.com/docs/en/about-claude/pricing 。
+**第四批 Sonnet 5 定价识别（`821aa72`）**：`cost.py` 补 `claude-sonnet-5` 内置价 $2/$10/$2.50/$0.20，`_FAMILY_FALLBACK` 里 `claude-sonnet` 前缀兜底指向 sonnet-5（承接未来 sonnet 变体）；`format.py` 加短名「Sonnet 5」；补 3 用例。该价格最初是导入价，Anthropic 于 2026-08-10 宣布永久生效，原定 9 月切换到 $3/$15 的计划已取消。来源：https://www.anthropic.com/news/claude-sonnet-5 。
 
 **第五批 `tt status` reset 过期显示修复（`5f83b5a`）**：久没用 → 5h/7d window 已滚但本次启动没拿到新 rate_limits，原显示「reset at 09:49」让用户以为是未来时间。`ui/status.py` 检测 `resets < now` 改显 `reset --`（整行保留、pct=0% 进度条还在），补 `test_render_status_expired_reset_shows_dash` 回归。
 
@@ -136,7 +138,6 @@
 - **Kimi Code usage adapter（报表接入，未启动）**：wire.jsonl 的 `usage.record`（`inputOther` / `output` / `inputCacheRead` / `inputCacheCreation` + epoch ms 时间）已是现成数据源，补 `adapters/kimi.py`（`detect()` + `load_entries()`）并进 `registry` 后，`tt daily/weekly/monthly/sessions/status` 即可覆盖 Kimi；注意 `kimi-code/k3` 等模型 id 的定价 key 与 `_FAMILY_FALLBACK` 口径要先定（当前会被 `("kimi", "kimi-k2.6")` 前缀兜底接住，价未必准）。
 - **自动 1/3 分屏跟随原会话退出（独立后续，未实现）**：不监听 `/quit` 文本，改由 `$tt-sidebar` launcher 沿父进程树定位原生 Codex PID 并传给 split；macOS 用 `kqueue` `EVFILT_PROC + NOTE_EXIT`、Linux 用 `pidfd` 阻塞等待真实进程退出，收到事件后退出 Textual 并关闭配对 pane。该路径应覆盖 `/quit`、`/exit`、崩溃和原 pane 关闭，不增加 transcript / SQLite 监听或周期 timer；iTerm2 `jobName` 变量监听只作终端专属备用，shell wrapper 需改变启动方式，均不作为主实现。Claude Code 继续优先使用官方 `SessionEnd`，强杀再走同类进程兜底。
 - **GitHub issue / PR 状态重新核对**：本地确认 #16 / #17 / #19 对应功能已经落地；外部 open/closed 状态在实际处理前重新查询，不沿用 2026-07-04 的旧快照。
-- **Sonnet 5 导入价切换**：2026-09-01 起内置价从 $2/$10 切到 $3/$15；届时先确认 litellm 在线表是否已接管。
 - 桌面版（Tauri）规划：图表可视化、数据钻取、实时监控、多 Agent 多模型监控（仅规划，未启动）
 - **会话内彩色报表 hook — 桌面多形态适配**（终端部分已落地，见「进行中」）：桌面 app / web GUI 不吃 ANSI（实测乱码），需按形态输出 HTML/markdown（`tt` 加 `--format`、hook 检测形态）。详见本地 `docs/cc-hook-tt-真彩色.md`。
 - **Sidebar 状态引擎 v2（独立迭代）**：把普通 `tt sidebar` 的状态判断从当前 `_infer_state` 时间窗口 + 单个 `pending_tool` 布尔值，升级为「生命周期事件为主、registry / rollout 快照恢复、现有启发式兜底」的每会话状态机；自动 1/3 分屏继续保持纯提示词视图，不显示状态或当前动作，也不与本迭代混做。
@@ -152,6 +153,8 @@
 - 纯 osascript 无法在 iTerm2 原生全屏下调整 pane 列宽；当前安全回滚并提示退出全屏，若以后要求原生全屏 1/3，需重新评估 Python API fallback 或 macOS Accessibility 方案。
 
 ## 最近验证
+
+- **2026-08-30 10:55**：**模型定价全面校准与动态计价落地（已实现验证，待发版）**。官方页确认 DeepSeek 新价自 2026-08-16 16:00 UTC 生效，仅周一至周五 UTC 01:00-04:00、06:00-10:00 为峰时，周末全天谷价；同步更新 GPT-5.6、Claude Mythos／Sonnet、GLM、Qwen、Doubao、Grok 等最新价与模型识别。计价器支持按单次请求选择峰谷／长上下文档，Codex 从 `last_token_usage` 保存逐请求 segment，状态栏同口径并升 1.7；补生效时刻、峰谷边界、周六／周日、阶梯边界、provider key、旧版 DeepSeek 隔离与跨时段会话回归。完整 pytest **362 全绿**、英文 dumb terminal CI 模拟 **362 全绿**、Ruff 全过、mypy 41 个源文件 0 报错，`git diff --check` 通过。
 
 - **2026-08-25 21:57**：**版本升至 0.5.6 并完成 GitHub / PyPI 发布与远端回验**。`pyproject.toml` / `uv.lock` 同步 0.5.6，release commit `fb27d57` 与 annotated tag `v0.5.6` 已 push。发布前完整 pytest 与英文 dumb terminal CI 模拟均 **344 全绿**，Ruff 全过、mypy 41 个源文件 0 报错；sdist / wheel 构建与 Twine check 通过。PyPI JSON 已传播，远端 wheel SHA-256 `0d90c7de…`、sdist SHA-256 `3ac94964…` 与本地产物一致；Simple 索引延迟约 1 分钟后，`uvx --no-cache --from token-tracker==0.5.6` 隔离安装正确输出 0.5.6；用户级 `tt` 已 `uv tool upgrade` 至 0.5.6。
 

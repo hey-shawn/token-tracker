@@ -250,6 +250,44 @@ def test_codex_statusline_records_terminal_map_without_touching_cc_status(tmp_pa
     }
 
 
+def test_codex_statusline_deepseek_cost_uses_each_request_time(tmp_path):
+    script = tmp_path / "codex-statusline.py"
+    script.write_text(hooks._render_codex_statusline_hook(), encoding="utf-8")
+    rollout = tmp_path / "deepseek.jsonl"
+    rows = [
+        {"timestamp": "2026-08-17T00:00:00Z", "type": "session_meta", "payload": {
+            "id": "deepseek-s1", "timestamp": "2026-08-17T00:00:00Z",
+            "cwd": str(tmp_path), "model_provider": "deepseek",
+        }},
+        {"timestamp": "2026-08-17T00:00:01Z", "type": "turn_context", "payload": {
+            "model": "deepseek-v4-flash", "effort": "high",
+        }},
+        {"timestamp": "2026-08-17T01:00:00Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+                "last_token_usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+            },
+        }},
+        {"timestamp": "2026-08-22T01:00:00Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 2_000_000, "output_tokens": 2_000_000},
+                "last_token_usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+            },
+        }},
+    ]
+    rollout.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    payload = {"transcript_path": str(rollout), "cwd": str(tmp_path)}
+
+    result = subprocess.run(
+        [sys.executable, str(script)], input=json.dumps(payload), text=True,
+        capture_output=True, check=True, env={**os.environ, "HOME": str(tmp_path)},
+    )
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+
+    # 周一峰时 ¥12 + 周六谷时 ¥6，按 7.1 折算后为 $2.54；不能拿当前时段套整段会话。
+    assert "Cost: $2.54" in plain
+
+
 def test_codex_statusline_config_migration_preserves_state_and_user_stop(tmp_path, monkeypatch):
     # 只迁移 Token Tracker 的旧内联 Stop；[hooks.state] 信任记录与用户 Stop 一字不动。
     import tomllib

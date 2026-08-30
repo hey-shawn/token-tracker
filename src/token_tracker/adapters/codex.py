@@ -3,7 +3,7 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .types import AgentInfo, RateLimits, UsageEntry, normalize_pct
+from .types import AgentInfo, RateLimits, UsageEntry, UsageSegment, normalize_pct
 from .util import codex_home, file_may_have_events_since, iter_jsonl_dicts, project_from_cwd
 
 CODEX_DIR = codex_home()
@@ -221,6 +221,8 @@ def _parse_jsonl(
     last_usage = None
     msg_count = 0
     session_end_ts: datetime | None = None
+    pricing_segments: list[UsageSegment] = []
+    seen_segment_totals: set[tuple[int, int, int]] = set()
 
     for data in iter_jsonl_dicts(path):
         row_type = data.get("type")
@@ -253,6 +255,7 @@ def _parse_jsonl(
             if info and info.get("total_token_usage"):
                 last_usage = info["total_token_usage"]
                 msg_count += 1
+                _append_pricing_segment(data, info, pricing_segments, seen_segment_totals)
 
     if not last_usage or not session_id:
         return
@@ -292,4 +295,52 @@ def _parse_jsonl(
         agent_id="codex",
         message_count=msg_count,
         session_end=session_end_ts,
+        pricing_segments=tuple(pricing_segments),
     ))
+
+
+def _append_pricing_segment(
+    data: dict,
+    info: dict,
+    segments: list[UsageSegment],
+    seen_totals: set[tuple[int, int, int]],
+) -> None:
+    """Codex token_count 会重复发同一累计快照；按 total 去重后保留每轮 last_token_usage。"""
+    total = info.get("total_token_usage")
+    last = info.get("last_token_usage")
+    if not isinstance(total, dict) or not isinstance(last, dict):
+        return
+    signature = (
+        total.get("input_tokens", 0),
+        total.get("cached_input_tokens", 0),
+        total.get("output_tokens", 0),
+    )
+    if signature in seen_totals:
+        return
+    timestamp = _parse_timestamp(data.get("timestamp"))
+    if timestamp is None:
+        return
+    cached = last.get("cached_input_tokens", 0)
+    total_in = last.get("input_tokens", 0)
+    output = last.get("output_tokens", 0)
+    if not all(isinstance(v, int) and v >= 0 for v in (cached, total_in, output)):
+        return
+    uncached = max(0, total_in - cached)
+    if not (uncached or cached or output):
+        return
+    seen_totals.add(signature)
+    segments.append(UsageSegment(
+        timestamp=timestamp,
+        input_tokens=uncached,
+        output_tokens=output,
+        cache_read_tokens=cached,
+    ))
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None

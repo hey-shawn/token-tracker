@@ -5,7 +5,7 @@ from urllib.error import URLError
 
 import pytest
 
-from token_tracker.adapters.types import UsageEntry
+from token_tracker.adapters.types import UsageEntry, UsageSegment
 from token_tracker.analyzer import cost
 
 
@@ -125,24 +125,51 @@ def test_gpt55_priced_4x_gpt5(monkeypatch):
 
 
 def test_gpt56_tiers_priced_per_tier_not_swallowed_by_gpt5(monkeypatch):
-    # GPT-5.6 三档是全新定价（2026-07-09 GA，7-30 调价后）："gpt-5.6-*" 会被 "gpt-5"
-    # 前缀吞掉错价（$1.25/$10），必须有各自专属内置价
+    # GPT-5.6 三档是独立定价："gpt-5.6-*" 不能被 "gpt-5" 前缀吞掉。
     monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
     sol = make_entry(model="gpt-5.6-sol", input_tokens=1_000_000, output_tokens=1_000_000)
-    assert cost.calculate_cost(sol) == pytest.approx(5.0 + 30.0)
+    assert cost.calculate_cost(sol) == pytest.approx(8.0 + 30.0)
     terra = make_entry(model="gpt-5.6-terra", input_tokens=1_000_000, output_tokens=1_000_000)
-    assert cost.calculate_cost(terra) == pytest.approx(2.0 + 12.0)
+    assert cost.calculate_cost(terra) == pytest.approx(4.0 + 18.0)
     luna = make_entry(model="gpt-5.6-luna", input_tokens=1_000_000, output_tokens=1_000_000)
-    assert cost.calculate_cost(luna) == pytest.approx(0.2 + 1.2)
+    assert cost.calculate_cost(luna) == pytest.approx(0.4 + 1.8)
     # dated / variant 后缀靠前缀命中本档，不被 gpt-5 吞
     dated = make_entry(model="gpt-5.6-terra-20260709", input_tokens=1_000_000)
-    assert cost.calculate_cost(dated) == pytest.approx(2.0)
+    assert cost.calculate_cost(dated) == pytest.approx(4.0)
     # 裸 "gpt-5.6"（无档位后缀）反向兜底到最短 key，即旗舰 sol
     bare = make_entry(model="gpt-5.6", input_tokens=1_000_000)
-    assert cost.calculate_cost(bare) == pytest.approx(5.0)
+    assert cost.calculate_cost(bare) == pytest.approx(8.0)
     # 系列内未知新档退回旗舰 sol 价（宁可高估不低估），不按 gpt-5 错价、不归零
     nova = make_entry(model="gpt-5.6-nova", input_tokens=1_000_000)
-    assert cost.calculate_cost(nova) == pytest.approx(5.0)
+    assert cost.calculate_cost(nova) == pytest.approx(8.0)
+
+
+def test_gpt56_long_context_uses_request_tier(monkeypatch):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    at_boundary = make_entry(
+        model="gpt-5.6-sol", input_tokens=271_000, output_tokens=1_000_000,
+        cache_read_tokens=1_000,
+    )
+    assert cost.calculate_cost(at_boundary) == pytest.approx(271_000 * 4e-6 + 20 + 0.0004)
+
+    above_boundary = make_entry(
+        model="gpt-5.6-sol", input_tokens=271_001, output_tokens=1_000_000,
+        cache_read_tokens=1_000,
+    )
+    assert cost.calculate_cost(above_boundary) == pytest.approx(271_001 * 8e-6 + 30 + 0.0008)
+
+
+def test_codex_long_context_is_priced_per_request_not_session_total(monkeypatch):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    segments = (
+        UsageSegment(datetime(2026, 8, 20, tzinfo=UTC), 150_000, 10_000),
+        UsageSegment(datetime(2026, 8, 20, 1, tzinfo=UTC), 150_000, 10_000),
+    )
+    entry = make_entry(
+        model="gpt-5.6-sol", agent_id="codex", input_tokens=300_000, output_tokens=20_000,
+        pricing_segments=segments,
+    )
+    assert cost.calculate_cost(entry) == pytest.approx(300_000 * 4e-6 + 20_000 * 20e-6)
 
 
 def test_gpt56_and_opus5_have_short_names():
@@ -160,10 +187,13 @@ def test_opus5_falls_back_to_opus_family_pricing(monkeypatch):
 
 def test_codex_auto_review_falls_back_to_gpt56_sol(monkeypatch):
     # Codex stop-time auto-review 用虚拟 model name codex-auto-review，按当代旗舰（gpt-5.6-sol）价兜底
-    # （不归零）；与 gpt-5.5 同价 $5/$30，期望值不变
+    # （不归零）。
     monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
-    entry = make_entry(model="codex-auto-review", input_tokens=1_000_000, output_tokens=1_000_000)
-    assert cost.calculate_cost(entry) == pytest.approx(35.0)
+    entry = make_entry(
+        model="codex-auto-review", agent_id="codex",
+        input_tokens=1_000_000, output_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(entry) == pytest.approx(24.0)
 
 
 def test_fallback_pricing_includes_fable():
@@ -171,6 +201,12 @@ def test_fallback_pricing_includes_fable():
     info = cost._fallback_pricing()["claude-fable-5"]
     assert info["input_cost_per_token"] == pytest.approx(10e-6)
     assert info["output_cost_per_token"] == pytest.approx(50e-6)
+
+
+def test_mythos_uses_fable_pricing(monkeypatch):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    entry = make_entry(model="claude-mythos-5", input_tokens=1_000_000, output_tokens=1_000_000)
+    assert cost.calculate_cost(entry) == pytest.approx(10.0 + 50.0)
 
 
 def test_fable_cost_is_double_opus(monkeypatch):
@@ -192,9 +228,8 @@ def test_fable_dated_variant_resolves_via_prefix(monkeypatch):
     assert cost.calculate_cost(entry) == pytest.approx(10.0)
 
 
-def test_fallback_pricing_includes_sonnet_5_introductory():
-    # Sonnet 5 当前处于导入价阶段（截止 2026-08-31），$2 / $10 是 Sonnet 4.6（$3/$15）的 2/3；
-    # 官方页明示 2026-09-01 起改为标准价 $3/$15，到期须同步（也可能靠 litellm 在线表自动接管）。
+def test_fallback_pricing_includes_sonnet_5_permanent_price():
+    # Anthropic 已宣布 Sonnet 5 的 $2/$10 价格永久生效。
     info = cost._fallback_pricing()["claude-sonnet-5"]
     assert info["input_cost_per_token"] == pytest.approx(2e-6)
     assert info["output_cost_per_token"] == pytest.approx(10e-6)
@@ -202,8 +237,8 @@ def test_fallback_pricing_includes_sonnet_5_introductory():
     assert info["cache_read_input_token_cost"] == pytest.approx(0.2e-6)
 
 
-def test_sonnet_5_cost_uses_introductory_price(monkeypatch):
-    # 1M input + 1M output → 2 + 10 = 12 USD（导入价，非 Sonnet 4.6 的 3+15=18）
+def test_sonnet_5_cost_uses_permanent_price(monkeypatch):
+    # 1M input + 1M output → 2 + 10 = 12 USD。
     monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
     entry = make_entry(model="claude-sonnet-5", input_tokens=1_000_000, output_tokens=1_000_000)
     assert cost.calculate_cost(entry) == pytest.approx(12.0)
@@ -211,7 +246,7 @@ def test_sonnet_5_cost_uses_introductory_price(monkeypatch):
 
 def test_sonnet_family_fallback_points_to_sonnet_5(monkeypatch):
     # 未来 sonnet 变体（如假想 claude-sonnet-5-1、claude-sonnet-6）系列兜底应指向 sonnet-5，
-    # 不再是过时的 sonnet-4-6；1M input → $2（导入价），而非 sonnet-4-6 的 $3
+    # 不再是过时的 sonnet-4-6；1M input → $2，而非 sonnet-4-6 的 $3。
     monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
     entry = make_entry(model="claude-sonnet-6-20270101", input_tokens=1_000_000)
     assert cost.calculate_cost(entry) == pytest.approx(2.0)
@@ -302,10 +337,12 @@ def test_fallback_pricing_includes_chinese_models():
     pricing = cost._fallback_pricing()
     for k in (
         "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5", "moonshot-v1-128k",
-        "glm-4.6", "glm-4.5-air", "glm-5",
-        "qwen3-coder-plus", "qwen-max", "qwen-plus",
-        "doubao-seed-1-6", "doubao-seed-code", "doubao-1-5-pro-32k", "doubao-1-5-pro-256k",
-        "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner",
+        "glm-4.6", "glm-4.5-air", "glm-5", "glm-5.1",
+        "qwen3-coder-plus", "qwen3-coder-next", "qwen-max", "qwen-plus",
+        "doubao-seed-1-6", "doubao-seed-code", "doubao-seed-2.0-code", "doubao-seed-2.1-pro",
+        "doubao-1-5-pro-32k", "doubao-1-5-pro-256k",
+        "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp",
+        "deepseek-chat", "deepseek-reasoner",
         "MiniMax-M2", "MiniMax-M2.7", "MiniMax-M3",
         "mimo-v2.5-pro", "mimo-v2.5",
     ):
@@ -331,13 +368,83 @@ def test_kimi_cny_converted_to_usd(monkeypatch):
     assert cost.calculate_cost(entry) == pytest.approx((6.5 + 27 + 1.3) / 7.1)
 
 
-def test_deepseek_and_qwen_cny_base_tier(monkeypatch):
-    # DeepSeek V4-Flash ¥1/¥2；Qwen3-Coder 取 0-32K 档 ¥4/¥16，均 ÷7.1
+def test_deepseek_old_price_and_qwen_cny_base_tier(monkeypatch):
+    # DeepSeek 在新价生效前仍按旧价 ¥1/¥2；Qwen3-Coder Plus 基础档 ¥4/¥16，均 ÷7.1。
     monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
     ds = make_entry(model="deepseek-v4-flash", input_tokens=1_000_000, output_tokens=1_000_000)
     assert cost.calculate_cost(ds) == pytest.approx((1 + 2) / 7.1)
     qw = make_entry(model="qwen3-coder-plus", input_tokens=1_000_000, output_tokens=1_000_000)
     assert cost.calculate_cost(qw) == pytest.approx((4 + 16) / 7.1)
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "expected_cny"),
+    [
+        (datetime(2026, 8, 17, 1, 0, tzinfo=UTC), 3 + 9 + 0.1),   # 周一第一段峰时
+        (datetime(2026, 8, 17, 4, 0, tzinfo=UTC), 1.5 + 4.5 + 0.05),
+        (datetime(2026, 8, 17, 6, 0, tzinfo=UTC), 3 + 9 + 0.1),   # 周一第二段峰时
+        (datetime(2026, 8, 17, 10, 0, tzinfo=UTC), 1.5 + 4.5 + 0.05),
+        (datetime(2026, 8, 22, 1, 0, tzinfo=UTC), 1.5 + 4.5 + 0.05),  # 周六全天谷价
+        (datetime(2026, 8, 23, 6, 0, tzinfo=UTC), 1.5 + 4.5 + 0.05),  # 周日全天谷价
+    ],
+)
+def test_deepseek_flash_new_peak_off_peak_and_weekends(monkeypatch, timestamp, expected_cny):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    entry = make_entry(
+        model="deepseek-v4-flash", timestamp=timestamp,
+        input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(entry) == pytest.approx(expected_cny / 7.1)
+
+
+def test_deepseek_pro_new_peak_and_off_peak(monkeypatch):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    peak = make_entry(
+        model="deepseek-v4-pro", timestamp=datetime(2026, 8, 17, 1, tzinfo=UTC),
+        input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(peak) == pytest.approx((9 + 27 + 0.3) / 7.1)
+    weekend = make_entry(
+        model="deepseek-v4-pro", timestamp=datetime(2026, 8, 22, 1, tzinfo=UTC),
+        input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(weekend) == pytest.approx((4.5 + 13.5 + 0.15) / 7.1)
+
+
+def test_deepseek_price_switch_timestamp(monkeypatch):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    before = make_entry(
+        model="deepseek-v4-flash", timestamp=datetime(2026, 8, 16, 15, 59, 59, tzinfo=UTC),
+        input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(before) == pytest.approx((1 + 2 + 0.02) / 7.1)
+    after = make_entry(
+        model="deepseek-v4-flash", timestamp=datetime(2026, 8, 16, 16, tzinfo=UTC),
+        input_tokens=1_000_000, output_tokens=1_000_000, cache_read_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(after) == pytest.approx((1.5 + 4.5 + 0.05) / 7.1)
+
+
+def test_deepseek_v4_dynamic_price_does_not_override_explicit_old_model(monkeypatch):
+    monkeypatch.setattr(cost, "_pricing", {
+        "deepseek-v3.2": {"input_cost_per_token": 7e-6, "output_cost_per_token": 11e-6},
+    })
+    entry = make_entry(
+        model="deepseek-v3.2", timestamp=datetime(2026, 8, 22, 1, tzinfo=UTC),
+        input_tokens=1_000_000, output_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(entry) == pytest.approx(18.0)
+
+
+def test_qwen_and_doubao_long_context_tiers(monkeypatch):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    qwen = make_entry(model="qwen3-coder-next", input_tokens=128_001, output_tokens=1_000_000)
+    assert cost.calculate_cost(qwen) == pytest.approx((128_001 * 2.5e-6 + 10) / 7.1)
+    doubao = make_entry(
+        model="doubao-seed-2.0-code", input_tokens=128_001, output_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(doubao) == pytest.approx((128_001 * 9.6e-6 + 48 + 1.92) / 7.1)
 
 
 def test_minimax_m2_usd_pricing(monkeypatch):
@@ -389,10 +496,12 @@ def test_chinese_models_have_short_names():
     for k in (
         "kimi-k3", "kimi-k2.7-code", "kimi-k2.6", "kimi-k2.5",
         "moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k",
-        "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.7", "glm-5",
-        "qwen3-coder-plus", "qwen-max", "qwen-plus",
-        "doubao-seed-1-6", "doubao-seed-code", "doubao-1-5-pro-32k", "doubao-1-5-pro-256k",
-        "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-chat", "deepseek-reasoner",
+        "glm-4.6", "glm-4.5", "glm-4.5-air", "glm-4.7", "glm-5", "glm-5.1",
+        "qwen3-coder-plus", "qwen3-coder-next", "qwen-max", "qwen-plus",
+        "doubao-seed-1-6", "doubao-seed-code", "doubao-seed-2.0-code", "doubao-seed-2.1-pro",
+        "doubao-1-5-pro-32k", "doubao-1-5-pro-256k",
+        "deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp",
+        "deepseek-chat", "deepseek-reasoner",
         "MiniMax-M2", "MiniMax-M2.1", "MiniMax-M2.5", "MiniMax-M2.7", "MiniMax-M3",
         "mimo-v2.5-pro", "mimo-v2.5",
     ):
@@ -402,16 +511,41 @@ def test_chinese_models_have_short_names():
 def test_grok_pricing_and_retirement_routing(monkeypatch):
     # xAI Grok 官方 USD（docs.x.ai）；2026-05-15 退役 slug 按官方路由到 grok-4.3 / grok-build-0.1
     monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
-    flagship = make_entry(model="grok-4.3", input_tokens=1_000_000, output_tokens=1_000_000)
-    assert cost.calculate_cost(flagship) == pytest.approx(1.25 + 2.5)
-    coding = make_entry(model="grok-build-0.1", input_tokens=1_000_000, output_tokens=1_000_000)
-    assert cost.calculate_cost(coding) == pytest.approx(1.0 + 2.0)
+    flagship = make_entry(model="grok-4.3", input_tokens=100_000, output_tokens=1_000_000)
+    assert cost.calculate_cost(flagship) == pytest.approx(0.125 + 2.5)
+    coding = make_entry(model="grok-build-0.1", input_tokens=100_000, output_tokens=1_000_000)
+    assert cost.calculate_cost(coding) == pytest.approx(0.1 + 2.0)
     # 退役别名 grok-code-fast-1 → build-0.1 价（¥ 无关，纯 USD）
-    alias = make_entry(model="grok-code-fast-1", input_tokens=1_000_000, output_tokens=1_000_000)
-    assert cost.calculate_cost(alias) == pytest.approx(3.0)
+    alias = make_entry(model="grok-code-fast-1", input_tokens=100_000, output_tokens=1_000_000)
+    assert cost.calculate_cost(alias) == pytest.approx(2.1)
     # 退役 slug grok-4-fast / grok-3 → grok-4.3 价（官方就这么路由）
-    assert cost.calculate_cost(make_entry(model="grok-4-fast", input_tokens=1_000_000)) == pytest.approx(1.25)
-    assert cost.calculate_cost(make_entry(model="grok-3", input_tokens=1_000_000)) == pytest.approx(1.25)
+    assert cost.calculate_cost(make_entry(model="grok-4-fast", input_tokens=1_000_000)) == pytest.approx(2.5)
+    assert cost.calculate_cost(make_entry(model="grok-3", input_tokens=1_000_000)) == pytest.approx(2.5)
+
+
+def test_grok_new_models_and_long_context(monkeypatch):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    base = make_entry(model="grok-4.6", input_tokens=199_999, output_tokens=1_000_000)
+    assert cost.calculate_cost(base) == pytest.approx(199_999 * 2e-6 + 6)
+    long = make_entry(
+        model="grok-4.6", input_tokens=200_000, output_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(long) == pytest.approx(200_000 * 4e-6 + 12 + 1)
+
+
+@pytest.mark.parametrize(
+    ("model", "provider_key", "expected"),
+    [
+        ("grok-4.6", "xai/grok-4.6", 2.0),
+        ("glm-5.3", "zai/glm-5.3", 1.4),
+    ],
+)
+def test_bare_model_resolves_official_provider_key(monkeypatch, model, provider_key, expected):
+    monkeypatch.setattr(cost, "_pricing", {
+        provider_key: {"input_cost_per_token": expected * 1e-6, "output_cost_per_token": 0},
+    })
+    assert cost.calculate_cost(make_entry(model=model, input_tokens=1_000_000)) == pytest.approx(expected)
 
 
 def test_gemini_and_grok_short_names():
@@ -419,6 +553,7 @@ def test_gemini_and_grok_short_names():
     from token_tracker.ui.format import MODEL_SHORT
     for k in (
         "gemini-2.5-pro", "gemini-3-pro-preview", "gemini-3.5-flash",
-        "grok-4.3", "grok-build-0.1", "grok-code-fast-1",
+        "gemini-3.6-flash", "gemini-3.7-pro",
+        "grok-4.3", "grok-4.5", "grok-4.6", "grok-build-0.1", "grok-code-fast-1",
     ):
         assert k in MODEL_SHORT, f"MODEL_SHORT missing {k}"

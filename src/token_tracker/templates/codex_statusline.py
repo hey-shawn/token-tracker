@@ -180,10 +180,20 @@ def _ctx_pct(info):
     return None
 
 
-def _session_cost(info, model):
+def _session_cost(info, model, transcript_path=None):
     """第三方 API provider（deepseek 等）没有账号配额，改按会话 token 用量估成本（cost.py 定价）。
     解析不到定价 / 零用量返回 None（宁缺毋假 $0）。"""
     try:
+        from token_tracker.analyzer.cost import calculate_cost
+        if transcript_path and os.path.exists(transcript_path):
+            from token_tracker.adapters import codex
+            entries = []
+            codex._parse_jsonl(Path(transcript_path), {}, entries, set(), None)
+            if entries:
+                entries[0].model = model
+                cost = calculate_cost(entries[0])
+                return cost if cost > 0 else None
+
         u = (info or {}).get("total_token_usage") or {}
         cached = u.get("cached_input_tokens", 0)
         total_in = u.get("input_tokens", 0)
@@ -192,7 +202,6 @@ def _session_cost(info, model):
         if not model or (total_in == 0 and total_out == 0):
             return None
         from token_tracker.adapters.types import UsageEntry
-        from token_tracker.analyzer.cost import calculate_cost
         entry = UsageEntry(
             timestamp=datetime.now(timezone.utc),
             session_id="", message_id="", request_id="", model=model,
@@ -314,7 +323,8 @@ def main():
         line1.append(f"{C['tokens']}Total: {fmt_tokens(total)}{RST}")  # 整体取 tokens 槽（mocha=peach/橙）
     model = model or payload.get("model") or ""  # session turn_context 的 model（gpt-5.5）优先
     # 第三方 API provider（deepseek 等）无账号配额：L1 补会话成本（仿 CC 的 Cost 槽位）
-    cost = _session_cost(info, model) if provider and provider != "openai" else None
+    transcript_path = payload.get("transcript_path") if exact_session else None
+    cost = _session_cost(info, model, transcript_path) if provider and provider != "openai" else None
     if cost is not None:
         cost_s = f"${cost:.2f}" if cost >= 0.01 else f"${cost:.4f}"
         line1.append(f"{C['total']}Cost: {cost_s}{RST}")

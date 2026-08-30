@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 from token_tracker.adapters import codex
@@ -61,8 +62,6 @@ def test_session_end_recorded_from_last_event(tmp_path):
 
 def test_codex_single_entry_yields_real_duration():
     # 回归：codex 每会话仅 1 条 entry，靠 session_end 让 aggregate_sessions 算出真实跨度（旧版恒为 0）
-    from datetime import UTC, datetime
-
     from token_tracker.adapters.types import UsageEntry
     from token_tracker.analyzer.aggregator import aggregate_sessions
     e = UsageEntry(
@@ -192,6 +191,45 @@ def test_reasoning_tokens_not_double_counted(tmp_path):
     assert entries[0].input_tokens == 18406 - 9216
     assert entries[0].output_tokens == 1054  # 不含 reasoning 803
     assert entries[0].cache_read_tokens == 9216
+
+
+def test_pricing_segments_preserve_each_request_and_skip_duplicate_snapshots(tmp_path):
+    events = [
+        {"timestamp": "2026-08-22T00:00:00.000Z", "type": "session_meta",
+         "payload": {"id": "s1", "timestamp": "2026-08-22T00:00:00.000Z", "cwd": "/tmp/proj"}},
+        {"timestamp": "2026-08-22T01:00:00.000Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10},
+                "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10},
+            },
+        }},
+        {"timestamp": "2026-08-22T01:00:01.000Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10},
+                "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10},
+            },
+        }},
+        {"timestamp": "2026-08-22T06:00:00.000Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 250, "cached_input_tokens": 70, "output_tokens": 30},
+                "last_token_usage": {"input_tokens": 150, "cached_input_tokens": 50, "output_tokens": 20},
+            },
+        }},
+    ]
+    path = _write_session(tmp_path, events)
+    entries: list = []
+    codex._parse_jsonl(path, {"s1": "deepseek-v4-flash"}, entries, set(), None)
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert (entry.input_tokens, entry.cache_read_tokens, entry.output_tokens) == (180, 70, 30)
+    assert len(entry.pricing_segments) == 2
+    assert (
+        entry.pricing_segments[0].input_tokens,
+        entry.pricing_segments[0].cache_read_tokens,
+        entry.pricing_segments[0].output_tokens,
+    ) == (80, 20, 10)
+    assert entry.pricing_segments[1].timestamp == datetime(2026, 8, 22, 6, tzinfo=UTC)
 
 
 def test_load_rate_limits_uses_newest_standard_event_across_sessions(tmp_path, monkeypatch):
