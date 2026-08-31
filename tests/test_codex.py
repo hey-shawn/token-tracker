@@ -232,6 +232,37 @@ def test_pricing_segments_preserve_each_request_and_skip_duplicate_snapshots(tmp
     assert entry.pricing_segments[1].timestamp == datetime(2026, 8, 22, 6, tzinfo=UTC)
 
 
+def test_session_snapshot_collects_statusline_data_in_one_scan(tmp_path, monkeypatch):
+    rl = {
+        "primary": {"used_percent": 12.0, "window_minutes": 300, "resets_at": 9_999_999_999},
+        "secondary": {"used_percent": 60.0, "window_minutes": 10080, "resets_at": 9_999_999_999},
+    }
+    path = _write_session(tmp_path, [
+        _meta_event("deepseek", session_id="snapshot-s1"),
+        {"timestamp": "2026-06-04T19:30:00.000Z", "type": "turn_context",
+         "payload": {"model": "deepseek-v4-flash", "effort": "high"}},
+        _token_count_event(rl, timestamp="2026-06-04T20:00:00.000Z"),
+    ])
+    original = codex.iter_jsonl_dicts
+    scans = 0
+
+    def counted(path_arg):
+        nonlocal scans
+        scans += 1
+        yield from original(path_arg)
+
+    monkeypatch.setattr(codex, "iter_jsonl_dicts", counted)
+    snapshot = codex.load_session_snapshot(path)
+
+    assert scans == 1
+    assert snapshot.session_id == "snapshot-s1"
+    assert snapshot.provider == "deepseek"
+    assert snapshot.model == "deepseek-v4-flash"
+    assert snapshot.effort == "high"
+    assert snapshot.rate_limits is not None and snapshot.rate_limits.five_hour_pct == 12.0
+    assert snapshot.usage_entry is not None and snapshot.usage_entry.model == "deepseek-v4-flash"
+
+
 def test_load_rate_limits_uses_newest_standard_event_across_sessions(tmp_path, monkeypatch):
     newer_standard = {
         "primary": {"used_percent": 73.0, "window_minutes": 10080, "resets_at": 9_999_999_999},

@@ -5,6 +5,8 @@
 
 ## 当前阶段
 
+**代码性能优化已完成（2026-08-31 20:08，未发版）**：daily/monthly 日期键移除高频 `strftime`，16,508 条 Kimi 真实数据聚合从约 0.71s/0.68s 降至 0.033s/0.027s；Codex 状态栏改由 adapter 单次扫描同时产出元数据、限额和逐请求计价 entry，200MB 真实会话从原 2～3 遍约 0.56～0.84s 收敛为单遍 0.31s，`STATUSLINE_HOOK_VERSION` 升至 1.8；`tt sessions` 从 24h 开始渐进扫描最近仍有写入的完整会话，以第 N 条 start 与窗口边界证明结果完整，候选不足才扩大直至全量，本机 Claude/Codex/Kimi 共约 6.5GB 历史的默认 20 条路径由全量 10.46s 降至 0.80s，且前 20 条 session id 逐项一致；Kimi 安装检测改看配置根目录，裸安装未产生 sessions 时也能进入 setup。完整 pytest 与英文 dumb terminal CI 模拟均 **367 全绿**，Ruff 全过、mypy 41 个源文件 0 报错，`git diff --check` 通过。
+
 **模型定价全面校准已完成（2026-08-30 10:55，未发版）**：按最新官方页更新 GPT-5.6 Sol 促销价与三档 >272K 阶梯价、Claude Mythos 5、GLM-5.1、Qwen3-Coder-Next、Doubao Seed 2.0 Code／2.1 Pro、DeepSeek V4 峰谷价、Grok 4.3／4.5／4.6 与 Build 长上下文价，并补 Gemini 3.6／3.7、GLM-5.3 等短名；Sonnet 5 的 $2/$10 已确认转为永久价，移除 9 月切价待办。模型解析新增官方 provider 前缀映射，解决 LiteLLM 仅有 `xai/`、`zai/` 等键时 bare model id 误落旧系列价。计价器现按单次请求 prompt 长度选阶梯档；Codex adapter 从 `last_token_usage` 保留逐请求时间与用量，使 DeepSeek 能按请求所在时段结算--周一至周五 UTC 01:00-04:00、06:00-10:00 为峰时，其余时段（含周末全天）为谷时，新价自 2026-08-16 16:00 UTC 生效。Codex 状态栏同步改为逐请求计价并升至 1.7。完整 pytest 与英文 dumb terminal CI 模拟均 **362 全绿**，Ruff 全过、mypy 41 个源文件 0 报错，`git diff --check` 通过。
 
 **`0.5.6` 已发布 PyPI（2026-08-25，源码与 tag 已 push）**：本版收口 Codex sidebar 注入噪声——`_CODEX_SKIP_PREFIXES` 补 `The following is the Codex agent history` / `>>> TRANSCRIPT` / `<codex_internal_context` 三个前缀（自动审批工具注入的 transcript 历史与 goal 模式内部上下文），`_hint_text` 对 `{` / `[` 开头的结构化输出直接返回空（审批 JSON 不再占「下一步」栏，CC / Kimi 同受益）。发布前完整 pytest **344 全绿**、英文 dumb terminal CI 模拟 **344 全绿**、Ruff 全过、mypy 41 个源文件 0 报错，`uv lock --check` 与 `git diff --check` 通过；真机 120h / 54 会话扫描注入残留 0 条。release commit `fb27d57` 与 annotated tag `v0.5.6` 已 push；sdist / wheel 构建与 Twine check 通过；PyPI JSON 已传播，远端 wheel SHA-256 `0d90c7de…`、sdist SHA-256 `3ac94964…` 与本地产物一致；`uvx --no-cache --from token-tracker==0.5.6` 安装后 `tt --version` 正确输出 0.5.6，用户级 `tt` 已升级。
@@ -135,7 +137,6 @@
 ## 待办 / 计划
 
 - **`tt sidebar` 点击跳转补 Ghostty（未启动）**：自动分屏已支持 Ghostty（2026-08-03），但总览「点头行跳窗格」仍只有 tmux（`TMUX_PANE` 映射）/ iTerm2（`ITERM_SESSION_ID` 映射）——三套 statusline 模板只采集这两类，`ui/sidebar_app._jump_argvs` 也只认这两类，Ghostty 会话头行当前不可点。Ghostty 无 per-pane 环境变量，statusline 渲染期不宜调 osascript（300ms 预算）；可行路径是点击时懒算：AppleScript `every terminal whose working directory is <会话 cwd>` 匹配后 `focus`（多窗格同项目时有歧义，需定优先级，如取 front window 首个匹配），或推动 Ghostty 暴露 surface id 环境变量后再走精确映射。README 对点击跳转的「iTerm2 / tmux」描述在补齐前保持现状（是准确描述，非遗漏）。
-- **Kimi Code usage adapter（报表接入，未启动）**：wire.jsonl 的 `usage.record`（`inputOther` / `output` / `inputCacheRead` / `inputCacheCreation` + epoch ms 时间）已是现成数据源，补 `adapters/kimi.py`（`detect()` + `load_entries()`）并进 `registry` 后，`tt daily/weekly/monthly/sessions/status` 即可覆盖 Kimi；注意 `kimi-code/k3` 等模型 id 的定价 key 与 `_FAMILY_FALLBACK` 口径要先定（当前会被 `("kimi", "kimi-k2.6")` 前缀兜底接住，价未必准）。
 - **自动 1/3 分屏跟随原会话退出（独立后续，未实现）**：不监听 `/quit` 文本，改由 `$tt-sidebar` launcher 沿父进程树定位原生 Codex PID 并传给 split；macOS 用 `kqueue` `EVFILT_PROC + NOTE_EXIT`、Linux 用 `pidfd` 阻塞等待真实进程退出，收到事件后退出 Textual 并关闭配对 pane。该路径应覆盖 `/quit`、`/exit`、崩溃和原 pane 关闭，不增加 transcript / SQLite 监听或周期 timer；iTerm2 `jobName` 变量监听只作终端专属备用，shell wrapper 需改变启动方式，均不作为主实现。Claude Code 继续优先使用官方 `SessionEnd`，强杀再走同类进程兜底。
 - **GitHub issue / PR 状态重新核对**：本地确认 #16 / #17 / #19 对应功能已经落地；外部 open/closed 状态在实际处理前重新查询，不沿用 2026-07-04 的旧快照。
 - 桌面版（Tauri）规划：图表可视化、数据钻取、实时监控、多 Agent 多模型监控（仅规划，未启动）
@@ -153,6 +154,8 @@
 - 纯 osascript 无法在 iTerm2 原生全屏下调整 pane 列宽；当前安全回滚并提示退出全屏，若以后要求原生全屏 1/3，需重新评估 Python API fallback 或 macOS Accessibility 方案。
 
 ## 最近验证
+
+- **2026-08-31 20:08**：**代码性能优化与 Kimi 裸安装检测修复完成**。真实数据基准：16,508 条 Kimi daily/monthly 聚合约 0.71s/0.68s → 0.033s/0.027s；200MB Codex 当前会话状态栏解析由 2～3 遍收敛为单遍 0.31s；三 Agent 默认 `tt sessions 20` 在约 6.5GB 历史下由全量 10.46s 降至 0.80s，前 20 条 session id 逐项一致，并补近期窗口完整会话、长会话扩窗、候选不足全量回退、状态栏单扫描和 Kimi 根目录检测回归。完整 pytest **367 全绿**、英文 dumb terminal CI 模拟 **367 全绿**、Ruff 全过、mypy 41 个源文件 0 报错、`git diff --check` 通过。
 
 - **2026-08-30 10:55**：**模型定价全面校准与动态计价落地（已实现验证，待发版）**。官方页确认 DeepSeek 新价自 2026-08-16 16:00 UTC 生效，仅周一至周五 UTC 01:00-04:00、06:00-10:00 为峰时，周末全天谷价；同步更新 GPT-5.6、Claude Mythos／Sonnet、GLM、Qwen、Doubao、Grok 等最新价与模型识别。计价器支持按单次请求选择峰谷／长上下文档，Codex 从 `last_token_usage` 保存逐请求 segment，状态栏同口径并升 1.7；补生效时刻、峰谷边界、周六／周日、阶梯边界、provider key、旧版 DeepSeek 隔离与跨时段会话回归。完整 pytest **362 全绿**、英文 dumb terminal CI 模拟 **362 全绿**、Ruff 全过、mypy 41 个源文件 0 报错，`git diff --check` 通过。
 

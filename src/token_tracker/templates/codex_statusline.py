@@ -2,9 +2,8 @@
 """token-tracker Codex 伪 statusline（Stop hook）：每次回答后追加两行彩色 status，仿 CC statusline。
 L1：[项目](分支 +A -D) | Total: <会话累计 token> | Cost: $<第三方 provider 会话成本> | Model: <模型>
 L2：Limit: 5h <bar> <%> (reset) | 7d <bar> <%> (reset) | <window> Ctx <bar> <%>
-数据：Total = 当前会话 total_token_usage（API 的 total_tokens = in+out，reasoning 是 out 子集不重复计）；5h/7d 优先取当前会话自己的
-rate_limits 快照（load_session_rate_limits），回退 codex.load_rate_limits(provider=当前会话
-model_provider)——同 CODEX_HOME 多账号/多 provider 混跑时不串配额；Ctx = last_input ÷ window；
+数据：单次扫描当前会话同时取得 Total、逐请求成本和 5h/7d 限额；当前会话没有标准限额时，按
+model_provider 回退最近同 provider 快照——同 CODEX_HOME 多账号/多 provider 混跑时不串配额；Ctx = last_input ÷ window；
 Model = Stop payload.model；会话按 transcript_path 精确定位、回退最近文件。
 由 `tt setup` 生成，勿手改。"""
 __version__ = "__STATUSLINE_HOOK_VERSION__"
@@ -68,27 +67,9 @@ def _total_tokens(info):
 
 
 def _parse_session(path):
-    """解析 session jsonl → (session_id, cwd, 最后一个 token_count 的 info, model, effort, provider)。
-    model/effort 取最后一个 turn_context（跟随中途换模型/调 effort）；
-    provider 取 session_meta.model_provider（多账号/多 provider 混跑时区分配额来源）。"""
-    from token_tracker.adapters.util import iter_jsonl_dicts
-    session_id = ""
-    cwd = ""
-    info = None
-    model = effort = provider = ""
-    for d in iter_jsonl_dicts(path):
-        p = d.get("payload", {})
-        t = d.get("type")
-        if t == "session_meta":
-            session_id = p.get("id", "") or session_id
-            cwd = p.get("cwd", "")
-            provider = p.get("model_provider", "") or provider
-        elif t == "turn_context":  # 含 model（gpt-5.5）+ effort（high）
-            model = p.get("model") or model
-            effort = p.get("effort") or effort
-        elif p.get("type") == "token_count" and p.get("info"):
-            info = p["info"]
-    return session_id, cwd, info, model, effort, provider
+    """单次扫描会话，得到元数据、用量、限额与逐请求计价数据。"""
+    from token_tracker.adapters.codex import load_session_snapshot
+    return load_session_snapshot(path)
 
 
 def _current_session(payload):
@@ -100,18 +81,18 @@ def _current_session(payload):
     try:
         tp = payload.get("transcript_path")
         if tp and os.path.exists(tp):
-            r = _parse_session(Path(tp))
-            if r[0] or r[2]:
-                return (*r, True)
+            snapshot = _parse_session(Path(tp))
+            if snapshot.session_id or snapshot.info:
+                return snapshot, True
         from token_tracker.adapters import codex
         for f in sorted(Path(codex.SESSIONS_DIR).rglob("*.jsonl"),
                         key=lambda p: p.stat().st_mtime, reverse=True)[:3]:
-            r = _parse_session(f)
-            if r[2]:
-                return (*r, False)
+            snapshot = _parse_session(f)
+            if snapshot.info:
+                return snapshot, False
     except Exception:
         pass
-    return "", "", None, "", "", "", False
+    return None, False
 
 
 def _record_terminal_map(session_id):
@@ -180,19 +161,15 @@ def _ctx_pct(info):
     return None
 
 
-def _session_cost(info, model, transcript_path=None):
+def _session_cost(info, model, usage_entry=None):
     """第三方 API provider（deepseek 等）没有账号配额，改按会话 token 用量估成本（cost.py 定价）。
     解析不到定价 / 零用量返回 None（宁缺毋假 $0）。"""
     try:
         from token_tracker.analyzer.cost import calculate_cost
-        if transcript_path and os.path.exists(transcript_path):
-            from token_tracker.adapters import codex
-            entries = []
-            codex._parse_jsonl(Path(transcript_path), {}, entries, set(), None)
-            if entries:
-                entries[0].model = model
-                cost = calculate_cost(entries[0])
-                return cost if cost > 0 else None
+        if usage_entry is not None:
+            usage_entry.model = model
+            cost = calculate_cost(usage_entry)
+            return cost if cost > 0 else None
 
         u = (info or {}).get("total_token_usage") or {}
         cached = u.get("cached_input_tokens", 0)
@@ -288,16 +265,21 @@ def main():
     except Exception:
         payload = {}
 
-    session_id, cwd, info, model, effort, provider, exact_session = _current_session(payload)
+    snapshot, exact_session = _current_session(payload)
+    session_id = snapshot.session_id if snapshot else ""
+    cwd = snapshot.cwd if snapshot else ""
+    info = snapshot.info if snapshot else None
+    model = snapshot.model if snapshot else ""
+    effort = snapshot.effort if snapshot else ""
+    provider = snapshot.provider if snapshot else ""
 
     # Limit：优先当前会话自己的限额快照（多账号/多 provider 混跑不串数据）；
     # 会话还没产生 token_count 时回退到同 provider 的最近会话。
     rl = None
     try:
         from token_tracker.adapters import codex
-        tp = payload.get("transcript_path")
-        if exact_session and tp:
-            rl = codex.load_session_rate_limits(tp)
+        if exact_session and snapshot:
+            rl = snapshot.rate_limits
         if rl is None:
             rl = codex.load_rate_limits(provider=provider or None)
     except Exception:
@@ -323,8 +305,8 @@ def main():
         line1.append(f"{C['tokens']}Total: {fmt_tokens(total)}{RST}")  # 整体取 tokens 槽（mocha=peach/橙）
     model = model or payload.get("model") or ""  # session turn_context 的 model（gpt-5.5）优先
     # 第三方 API provider（deepseek 等）无账号配额：L1 补会话成本（仿 CC 的 Cost 槽位）
-    transcript_path = payload.get("transcript_path") if exact_session else None
-    cost = _session_cost(info, model, transcript_path) if provider and provider != "openai" else None
+    usage_entry = snapshot.usage_entry if snapshot else None
+    cost = _session_cost(info, model, usage_entry) if provider and provider != "openai" else None
     if cost is not None:
         cost_s = f"${cost:.2f}" if cost >= 0.01 else f"${cost:.4f}"
         line1.append(f"{C['total']}Cost: {cost_s}{RST}")

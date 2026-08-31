@@ -56,7 +56,7 @@ def aggregate_daily(entries: list[UsageEntry]) -> list[DailyStats]:
     tz = system_tz()
     return _aggregate_by_key(
         entries,
-        lambda e: e.timestamp.astimezone(tz).strftime("%Y-%m-%d"),
+        lambda e: e.timestamp.astimezone(tz).date().isoformat(),
         lambda k, e: DailyStats(date=k),
         "date",
     )
@@ -64,9 +64,14 @@ def aggregate_daily(entries: list[UsageEntry]) -> list[DailyStats]:
 
 def aggregate_monthly(entries: list[UsageEntry]) -> list[MonthlyStats]:
     tz = system_tz()
+
+    def _month_key(e: UsageEntry) -> str:
+        local = e.timestamp.astimezone(tz)
+        return f"{local.year:04d}-{local.month:02d}"
+
     return _aggregate_by_key(
         entries,
-        lambda e: e.timestamp.astimezone(tz).strftime("%Y-%m"),
+        _month_key,
         lambda k, e: MonthlyStats(month=k),
         "month",
     )

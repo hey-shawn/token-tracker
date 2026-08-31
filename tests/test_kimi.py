@@ -36,12 +36,11 @@ def _load(sessions_dir: Path, hours_back: int = 0, monkeypatch=None) -> list:
     return kimi.load_entries(hours_back)
 
 
-def test_detect_requires_sessions_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(kimi, "SESSIONS_DIR", str(tmp_path / "missing"))
+def test_detect_uses_install_root_without_requiring_sessions(tmp_path, monkeypatch):
+    kimi_dir = tmp_path / ".kimi-code"
+    monkeypatch.setattr(kimi, "KIMI_DIR", str(kimi_dir))
     assert kimi.detect() is None
-    sessions_dir = tmp_path / "sessions"
-    sessions_dir.mkdir()
-    monkeypatch.setattr(kimi, "SESSIONS_DIR", str(sessions_dir))
+    kimi_dir.mkdir()
     info = kimi.detect()
     assert info is not None and info.id == "kimi" and info.name == "Kimi Code"
 
@@ -107,6 +106,19 @@ def test_hours_back_cutoff_filters_old_records(tmp_path, monkeypatch):
     entries = _load(sessions_dir, hours_back=1, monkeypatch=monkeypatch)
     assert len(entries) == 1
     assert entries[0].input_tokens == 200
+
+
+def test_recent_entries_keep_full_session_when_file_is_recent(tmp_path, monkeypatch):
+    sessions_dir = tmp_path / "sessions"
+    _write_session(sessions_dir, "session_s1", [
+        _usage_record(3600 * 10, inputOther=100, output=1),
+        _usage_record(3600 * 9, inputOther=200, output=1),
+    ])
+    monkeypatch.setattr(kimi, "SESSIONS_DIR", str(sessions_dir))
+
+    entries = kimi.load_recent_entries(datetime.now(UTC) - timedelta(hours=1))
+
+    assert [entry.input_tokens for entry in entries] == [100, 200]
 
 
 def test_subagent_wire_and_malformed_rows_ignored(tmp_path, monkeypatch):

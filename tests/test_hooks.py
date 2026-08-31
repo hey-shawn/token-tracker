@@ -203,6 +203,8 @@ def test_codex_statusline_render_injects_version():
     assert "__STATUSLINE_HOOK_VERSION__" not in rendered
     assert "__STATUSLINE_TRUECOLOR__" not in rendered  # 配色占位符已替换
     assert "'reset'" in rendered and "38;2" in rendered  # 注入了 truecolor 配色 dict（跟随主题）
+    assert ".load_session_rate_limits(" not in rendered
+    assert "codex._parse_jsonl" not in rendered
     compile(rendered, "<codex-statusline>", "exec")
 
 

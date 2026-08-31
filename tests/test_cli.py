@@ -1,7 +1,28 @@
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
+
 import pytest
 
 from token_tracker import cli
-from token_tracker.adapters.types import DailyStats
+from token_tracker.adapters.types import DailyStats, UsageEntry
+
+
+def _session_entry(start: datetime, session_id: str = "s1") -> UsageEntry:
+    return UsageEntry(
+        timestamp=start,
+        session_id=session_id,
+        message_id=session_id,
+        request_id="",
+        model="test-model",
+        input_tokens=1,
+        output_tokens=1,
+        cache_creation_tokens=0,
+        cache_read_tokens=0,
+        cost_usd=0,
+        project="proj",
+        agent_id="test",
+        session_end=start + timedelta(minutes=10),
+    )
 
 
 def test_parse_limit_accepts_positive_integer_only():
@@ -157,3 +178,60 @@ def test_current_session_agent_detects_kimi_via_fresh_cwd_session(monkeypatch):
     assert calls and calls[0].get("fresh_within_s")  # 必须限新鲜度，防常驻误判
     monkeypatch.setattr(cli.kimi, "current_session_id_for_cwd", lambda **kw: "")
     assert cli._current_session_agent() is None
+
+
+def test_recent_sessions_stop_after_first_proven_complete_window(monkeypatch):
+    calls: list[datetime] = []
+    recent = _session_entry(datetime.now(UTC) - timedelta(hours=1))
+    loader = SimpleNamespace(
+        load_recent_entries=lambda cutoff: calls.append(cutoff) or [recent],
+        load_entries=lambda **kwargs: pytest.fail("不应回退全量"),
+    )
+    monkeypatch.setattr(cli, "AGENT_LOADERS", {"test": loader})
+    monkeypatch.setattr(cli, "_SESSION_LOOKBACK_HOURS", (24, 168))
+
+    stats = cli._load_recent_session_stats([SimpleNamespace(id="test")], limit=1)
+
+    assert len(stats) == 1
+    assert len(calls) == 1
+
+
+def test_recent_sessions_expand_for_long_running_session(monkeypatch):
+    calls: list[datetime] = []
+    old_start = datetime.now(UTC) - timedelta(hours=48)
+    entry = _session_entry(old_start)
+    entry.session_end = datetime.now(UTC)
+    loader = SimpleNamespace(
+        load_recent_entries=lambda cutoff: calls.append(cutoff) or [entry],
+        load_entries=lambda **kwargs: pytest.fail("七天窗口已足够，不应回退全量"),
+    )
+    monkeypatch.setattr(cli, "AGENT_LOADERS", {"test": loader})
+    monkeypatch.setattr(cli, "_SESSION_LOOKBACK_HOURS", (24, 168))
+
+    stats = cli._load_recent_session_stats([SimpleNamespace(id="test")], limit=1)
+
+    assert len(stats) == 1
+    assert len(calls) == 2
+
+
+def test_recent_sessions_fall_back_to_full_history_when_candidates_insufficient(monkeypatch):
+    calls: list[datetime] = []
+    full_calls = 0
+
+    def load_full(**kwargs):
+        nonlocal full_calls
+        full_calls += 1
+        return [_session_entry(datetime.now(UTC) - timedelta(days=10))]
+
+    loader = SimpleNamespace(
+        load_recent_entries=lambda cutoff: calls.append(cutoff) or [],
+        load_entries=load_full,
+    )
+    monkeypatch.setattr(cli, "AGENT_LOADERS", {"test": loader})
+    monkeypatch.setattr(cli, "_SESSION_LOOKBACK_HOURS", (24, 168))
+
+    stats = cli._load_recent_session_stats([SimpleNamespace(id="test")], limit=2)
+
+    assert len(stats) == 1
+    assert len(calls) == 2
+    assert full_calls == 1
