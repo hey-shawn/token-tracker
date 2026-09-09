@@ -18,7 +18,7 @@
 - **当前会话自动分屏** — Codex 中显式执行 `$tt-sidebar`，在原会话右侧自动打开 1/3 宽度的独立提示词侧边栏
 - **限额监控** — 实时 5h / 7d 配额百分比 + 重置倒计时
 - **多维成本分析** — 会话 / 日 / 周 / 月多维报表，等效成本统计
-- **定价识别** — litellm 在线定价 + 内置官方价双层兜底，覆盖 Claude / OpenAI / Gemini / Grok 及国产主流（Kimi / GLM / Qwen / 豆包 / DeepSeek / MiniMax / MiMo）；按单次请求计算长上下文阶梯价与 DeepSeek 峰谷价（周末全天谷价），新模型自动套用同系列定价、不静默归零
+- **定价识别** -- litellm 在线定价 + 内置官方价双层兜底，覆盖 GPT-6 Astra、Claude Fable 5.1 及 Claude / OpenAI / Gemini / Grok 和国产主流（Kimi / GLM / Qwen / 豆包 / DeepSeek / MiniMax / MiMo）；按单次请求计算长上下文阶梯价与 DeepSeek 峰谷价（周末全天谷价），Codex 缓存读写分别计价；未知模型优先套用已知系列价，仍无法识别时提示缺价
 - **会话洞察** — 项目、模型、时长、消息数一览
 - **多主题统一配色** — 6 套主题（Catppuccin 全家 + Nord + Dracula），CLI 报表与各 Agent 状态栏**同源**，`tt theme` 一键切换
 - **零配置** — 自动检测已安装的 Agent，直接读取本地数据

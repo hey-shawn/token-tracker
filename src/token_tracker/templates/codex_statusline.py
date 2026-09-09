@@ -172,18 +172,18 @@ def _session_cost(info, model, usage_entry=None):
             return cost if cost > 0 else None
 
         u = (info or {}).get("total_token_usage") or {}
-        cached = u.get("cached_input_tokens", 0)
-        total_in = u.get("input_tokens", 0)
-        # reasoning_output_tokens 是 output_tokens 的子集拆分，output 价已含 reasoning，不能再加
-        total_out = u.get("output_tokens", 0)
-        if not model or (total_in == 0 and total_out == 0):
+        from token_tracker.adapters.codex import _usage_tokens
+        counts = _usage_tokens(u)
+        if not model or counts is None or not any(counts):
             return None
+        ordinary_in, total_out, written, cached = counts
+        # reasoning_output_tokens 是 output_tokens 的子集拆分，output 价已含 reasoning，不能再加
         from token_tracker.adapters.types import UsageEntry
         entry = UsageEntry(
             timestamp=datetime.now(timezone.utc),
             session_id="", message_id="", request_id="", model=model,
-            input_tokens=total_in - cached, output_tokens=total_out,
-            cache_creation_tokens=0, cache_read_tokens=cached,
+            input_tokens=ordinary_in, output_tokens=total_out,
+            cache_creation_tokens=written, cache_read_tokens=cached,
             cost_usd=None, project="", agent_id="codex",
         )
         cost = calculate_cost(entry)

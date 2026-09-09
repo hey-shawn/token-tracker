@@ -159,23 +159,89 @@ def test_gpt56_long_context_uses_request_tier(monkeypatch):
     assert cost.calculate_cost(above_boundary) == pytest.approx(271_001 * 8e-6 + 30 + 0.0008)
 
 
-def test_codex_long_context_is_priced_per_request_not_session_total(monkeypatch):
+@pytest.mark.parametrize("model, expected", [("gpt-5.6-sol", 1.6), ("gpt-6-astra", 4.0)])
+def test_codex_long_context_is_priced_per_request_not_session_total(monkeypatch, model, expected):
     monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
     segments = (
         UsageSegment(datetime(2026, 8, 20, tzinfo=UTC), 150_000, 10_000),
         UsageSegment(datetime(2026, 8, 20, 1, tzinfo=UTC), 150_000, 10_000),
     )
     entry = make_entry(
-        model="gpt-5.6-sol", agent_id="codex", input_tokens=300_000, output_tokens=20_000,
+        model=model, agent_id="codex", input_tokens=300_000, output_tokens=20_000,
         pricing_segments=segments,
     )
-    assert cost.calculate_cost(entry) == pytest.approx(300_000 * 4e-6 + 20_000 * 20e-6)
+    assert cost.calculate_cost(entry) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("segments", [(), (UsageSegment(datetime(2026, 9, 9, tzinfo=UTC), 300_000, 1),)])
+def test_astra_missing_request_usage_uses_base_price(monkeypatch, segments):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    entry = make_entry(
+        model="gpt-6-astra", agent_id="codex", input_tokens=600_000, output_tokens=2,
+        pricing_segments=segments,
+    )
+    assert cost.calculate_cost(entry) == pytest.approx(6.0001)
 
 
 def test_gpt56_and_opus5_have_short_names():
     from token_tracker.ui.format import MODEL_SHORT
     for k in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "claude-opus-5"):
         assert k in MODEL_SHORT, f"MODEL_SHORT missing {k}"
+
+
+@pytest.mark.parametrize("model", ["gpt-6-astra", "gpt-6-astra-20260901"])
+@pytest.mark.parametrize("extra_input, expected", [(0, 1.64), (1, 3.23002)])
+def test_astra_context_boundary_includes_both_cache_buckets(monkeypatch, model, extra_input, expected):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    entry = make_entry(
+        model=model, input_tokens=100_000 + extra_input, output_tokens=2_000,
+        cache_creation_tokens=32_000, cache_read_tokens=140_000,
+    )
+    assert cost.calculate_cost(entry) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("model, expected", [
+    ("claude-fable-5-1", 72.75),
+    ("claude-fable-5-1-20260901", 72.75),
+    ("claude-fable-5", 73.5),
+    ("claude-fable-5-20260609", 73.5),
+    ("claude-mythos-5", 73.5),
+])
+def test_fable51_cache_discount_preserves_old_models(monkeypatch, model, expected):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    entry = make_entry(
+        model=model, input_tokens=1_000_000, output_tokens=1_000_000,
+        cache_creation_tokens=1_000_000, cache_read_tokens=1_000_000,
+    )
+    assert cost.calculate_cost(entry) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("model, expected", [("gpt-6-astra", 0.001), ("claude-fable-5-1", 0.00025)])
+@pytest.mark.parametrize("stale", [False, True])
+def test_new_models_price_with_old_cache_and_no_network(tmp_path, monkeypatch, model, expected, stale):
+    cache = tmp_path / "pricing_cache.json"
+    cache.write_text(json.dumps({"claude-fable-5": cost._fallback_pricing()["claude-fable-5"]}))
+    monkeypatch.setattr(cost, "CACHE_PATH", cache)
+    monkeypatch.setattr(cost, "_cache_stale", lambda: stale)
+    monkeypatch.setattr(cost, "_pricing", None)
+
+    def offline():
+        if not stale:
+            pytest.fail("Fresh cache should not fetch")
+        raise URLError("offline")
+
+    monkeypatch.setattr(cost, "_fetch_and_cache", offline)
+    assert cost.calculate_cost(make_entry(model=model, cache_read_tokens=1_000)) == pytest.approx(expected)
+
+
+def test_new_models_short_names_and_astra_prefix_boundary():
+    from token_tracker.ui.format import _model_short
+
+    assert _model_short("gpt-6-astra") == "GPT-6 Astra"
+    assert _model_short("claude-fable-5-1") == "Fable 5.1"
+    pricing = cost._fallback_pricing()
+    assert cost._resolve_model_key("gpt-6-astral", pricing) is None
+    assert cost._resolve_model_key("gpt-60-astra", pricing) is None
 
 
 def test_opus5_falls_back_to_opus_family_pricing(monkeypatch):
@@ -253,10 +319,10 @@ def test_sonnet_family_fallback_points_to_sonnet_5(monkeypatch):
 
 
 def test_unknown_fable_variant_falls_back_to_family(monkeypatch):
-    # 未来的 fable-6 即便 litellm 未收录，也按系列退回 fable-5，不归零
+    # 未来 Fable 变体退回 5.1 的最新已知价，旧版精确 key 仍保留旧价。
     monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
-    entry = make_entry(model="claude-fable-6-20270101", input_tokens=1_000_000)
-    assert cost.calculate_cost(entry) == pytest.approx(10.0)
+    entry = make_entry(model="claude-fable-6-20270101", input_tokens=1_000_000, cache_read_tokens=1_000_000)
+    assert cost.calculate_cost(entry) == pytest.approx(10.25)
 
 
 def test_unknown_model_warns_once(fixed_pricing, monkeypatch, capsys):

@@ -27,7 +27,7 @@ _FAMILY_FALLBACK = (
     ("claude-opus", "claude-opus-4-8"),
     ("claude-sonnet", "claude-sonnet-5"),
     ("claude-haiku", "claude-haiku-4-5-20251001"),
-    ("claude-fable", "claude-fable-5"),
+    ("claude-fable", "claude-fable-5-1"),
     ("claude-mythos", "claude-mythos-5"),
     # GPT-5.6 三档并列（sol/terra/luna 各自有内置价，dated/variant 靠前缀命中）；系列内
     # 未知新档（如假想 gpt-5.6-nova）退回旗舰 sol——新档价未知时退回最贵档，宁可高估不低估
@@ -404,6 +404,9 @@ def _usd(input_m: float, output_m: float, cache_read_m: float | None = None) -> 
 
 def _fallback_pricing() -> dict:
     return {
+        # https://platform.claude.com/docs/en/models/fable-5-1/overview
+        # Fable 5.1 仅缓存读取降至 $0.25/MTok；旧 Fable 5 / Mythos 5 保留原价。
+        "claude-fable-5-1": {**_FABLE_PRICING, "cache_read_input_token_cost": 0.25e-6},
         "claude-fable-5": _FABLE_PRICING,
         "claude-mythos-5": _FABLE_PRICING,
         "claude-opus-4-8": _OPUS_PRICING,
@@ -428,6 +431,18 @@ def _fallback_pricing() -> dict:
             "output_cost_per_token": 5e-6,
             "cache_creation_input_token_cost": 1.25e-6,
             "cache_read_input_token_cost": 0.1e-6,
+        },
+        # https://developers.openai.com/api/docs/models/gpt-6-astra
+        # Standard：超过 272K 输入，整次请求 input/cache 2x、output 1.5x。
+        "gpt-6-astra": {
+            "input_cost_per_token": 10e-6,
+            "output_cost_per_token": 50e-6,
+            "cache_creation_input_token_cost": 12.5e-6,
+            "cache_read_input_token_cost": 1e-6,
+            "input_cost_per_token_above_272k_tokens": 20e-6,
+            "output_cost_per_token_above_272k_tokens": 75e-6,
+            "cache_creation_input_token_cost_above_272k_tokens": 25e-6,
+            "cache_read_input_token_cost_above_272k_tokens": 2e-6,
         },
         "gpt-5": {
             "input_cost_per_token": 1.25e-6,

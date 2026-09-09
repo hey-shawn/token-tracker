@@ -3,6 +3,8 @@ import os
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from token_tracker.adapters import codex
 
 
@@ -261,6 +263,50 @@ def test_session_snapshot_collects_statusline_data_in_one_scan(tmp_path, monkeyp
     assert snapshot.effort == "high"
     assert snapshot.rate_limits is not None and snapshot.rate_limits.five_hour_pct == 12.0
     assert snapshot.usage_entry is not None and snapshot.usage_entry.model == "deepseek-v4-flash"
+
+
+@pytest.mark.parametrize("written", [0, 30_000, 80_000])
+def test_astra_cache_writes_are_separate_and_totals_unchanged(tmp_path, monkeypatch, written):
+    from token_tracker.analyzer import cost
+
+    usage = {
+        "input_tokens": 100_000, "cached_input_tokens": 20_000,
+        "cache_write_input_tokens": written, "output_tokens": 2_000,
+        "reasoning_output_tokens": 1_000, "total_tokens": 102_000,
+    }
+    event = _token_count_event({})
+    event["payload"]["info"].update(total_token_usage=usage, last_token_usage=usage)
+    path = _write_session(tmp_path, [
+        _meta_event("openai"),
+        {"type": "turn_context", "payload": {"model": "gpt-6-astra", "effort": "max"}},
+        event, event,
+    ])
+    entry = codex.load_session_snapshot(path).usage_entry
+    assert entry is not None
+    assert entry.model == "gpt-6-astra"
+    assert entry.total_tokens == 102_000
+    assert entry.input_tokens == 80_000 - written
+    assert entry.cache_creation_tokens == written
+    assert entry.cache_read_tokens == 20_000
+    assert entry.output_tokens == 2_000
+    assert len(entry.pricing_segments) == 1
+    assert entry.pricing_segments[0].cache_creation_tokens == written
+    assert entry.pricing_segments[0].prompt_tokens == 100_000
+    assert cost._segments_cover_entry(entry)
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    assert cost.calculate_cost(entry) == pytest.approx(0.92 + written * 2.5e-6)
+
+
+@pytest.mark.parametrize("written", [-1, "30", None, True, 81])
+def test_invalid_codex_cache_write_counts_are_rejected(tmp_path, written):
+    usage = {
+        "input_tokens": 100, "cached_input_tokens": 20,
+        "cache_write_input_tokens": written, "output_tokens": 1,
+    }
+    event = _token_count_event({})
+    event["payload"]["info"].update(total_token_usage=usage, last_token_usage=usage)
+    path = _write_session(tmp_path, [_meta_event("openai"), event])
+    assert codex.load_session_snapshot(path).usage_entry is None
 
 
 def test_load_rate_limits_uses_newest_standard_event_across_sessions(tmp_path, monkeypatch):

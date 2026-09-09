@@ -9,6 +9,7 @@ AGENT_SHORT = {"claude-code": "Claude", "codex": "Codex", "kimi": "Kimi"}
 AGENT_LABEL = {"claude-code": "Claude Code", "codex": "Codex", "kimi": "Kimi Code"}
 
 MODEL_SHORT = {
+    "claude-fable-5-1": "Fable 5.1",
     "claude-fable-5": "Fable 5",
     "claude-mythos-5": "Mythos 5",
     "claude-opus-5": "Opus 5",
@@ -20,6 +21,7 @@ MODEL_SHORT = {
     "claude-sonnet": "Sonnet",
     "claude-haiku-4-5-20251001": "Haiku 4.5",
     "claude-haiku": "Haiku",
+    "gpt-6-astra": "GPT-6 Astra",
     # OpenAI GPT-5.6 系列（sol/terra/luna 三档）
     "gpt-5.6-sol": "GPT-5.6 Sol",
     "gpt-5.6-terra": "GPT-5.6 Terra",

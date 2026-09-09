@@ -290,6 +290,23 @@ def test_codex_statusline_deepseek_cost_uses_each_request_time(tmp_path):
     assert "Cost: $2.54" in plain
 
 
+@pytest.mark.parametrize("written, expected", [(None, 0.92), (30_000, 0.995), (-1, None)])
+def test_codex_statusline_fallback_prices_cache_writes(monkeypatch, written, expected):
+    from token_tracker.analyzer import cost
+
+    namespace = {"__name__": "test_codex_statusline"}
+    exec(compile(hooks._render_codex_statusline_hook(), "codex-statusline.py", "exec"), namespace)
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    usage = {"input_tokens": 100_000, "cached_input_tokens": 20_000, "output_tokens": 2_000}
+    if written is not None:
+        usage["cache_write_input_tokens"] = written
+    actual = namespace["_session_cost"]({"total_token_usage": usage}, "gpt-6-astra")
+    if expected is None:
+        assert actual is None
+    else:
+        assert actual == pytest.approx(expected)
+
+
 def test_codex_statusline_config_migration_preserves_state_and_user_stop(tmp_path, monkeypatch):
     # 只迁移 Token Tracker 的旧内联 Stop；[hooks.state] 信任记录与用户 Stop 一字不动。
     import tomllib

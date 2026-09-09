@@ -49,7 +49,7 @@ KIMI_STATUSLINE_QUOTA_PATH = os.path.join(_TT, "tt-kimi-quota.json")
 STATUS_FILE = config.STATUS_FILE                          # CC statusline 缓存（单一权威定义在 config）
 TERMINAL_MAP_FILE = config.TERMINAL_MAP_FILE              # Codex Stop hook 采集的终端定位映射
 HOOK_VERSION = "2.1"  # 2.0: 采集 _terminal_map（sidebar 点击跳转）；2.1: 共享状态无条件随帧携带、防异常帧清表
-STATUSLINE_HOOK_VERSION = "1.8"  # 1.8: 当前会话元数据、限额与成本合并为单次 JSONL 扫描
+STATUSLINE_HOOK_VERSION = "1.9"  # 1.9: 缓存写入独立计价，快照缺失时使用相同的 token 拆分
 KIMI_STATUSLINE_HOOK_VERSION = "1.2"  # 1.2: Model 段加实际 effort（wire thinkingEffort），新增 Out t/s（output÷请求时长）
 
 CC_BACKUP_PATH = os.path.join(_TT, "cc-backup.json")

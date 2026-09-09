@@ -48,7 +48,7 @@ class _SessionData:
     msg_count: int = 0
     session_end: datetime | None = None
     pricing_segments: list[UsageSegment] = field(default_factory=list)
-    seen_segment_totals: set[tuple[int, int, int]] = field(default_factory=set)
+    seen_segment_totals: set[tuple[int, int, int, int]] = field(default_factory=set)
     last_rate_payload: tuple[float, dict, dict, str] | None = None
 
 
@@ -308,18 +308,29 @@ def _read_session_data(path: Path) -> _SessionData:
     return state
 
 
+def _usage_tokens(usage: dict) -> tuple[int, int, int, int] | None:
+    """Codex input 包含缓存读写；拆为互斥桶，避免重复计数与缓存写入少计价。"""
+    total_in = usage.get("input_tokens", 0)
+    output = usage.get("output_tokens", 0)
+    cached = usage.get("cached_input_tokens", 0)
+    written = usage.get("cache_write_input_tokens", 0)
+    if not all(type(v) is int and v >= 0 for v in (total_in, output, cached, written)):
+        return None
+    if cached + written > total_in:
+        return None
+    return total_in - cached - written, output, written, cached
+
+
 def _usage_entry_from_data(data: _SessionData, models: dict[str, str]) -> UsageEntry | None:
     last_usage = (data.last_info or {}).get("total_token_usage")
     if not isinstance(last_usage, dict) or not data.session_id:
         return None
 
-    cached = last_usage.get("cached_input_tokens", 0)
-    input_tokens = last_usage.get("input_tokens", 0) - cached
-    # reasoning_output_tokens 是 output_tokens 的子集拆分（实测 total_tokens == input + output），不能再加
-    output_tokens = last_usage.get("output_tokens", 0)
-
-    if input_tokens == 0 and output_tokens == 0:
+    counts = _usage_tokens(last_usage)
+    if counts is None or not any(counts):
         return None
+    input_tokens, output_tokens, written, cached = counts
+    # reasoning_output_tokens 是 output_tokens 的子集拆分（实测 total_tokens == input + output），不能再加
 
     try:
         ts = datetime.fromisoformat(data.session_ts.replace("Z", "+00:00"))
@@ -336,7 +347,7 @@ def _usage_entry_from_data(data: _SessionData, models: dict[str, str]) -> UsageE
         model=model,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        cache_creation_tokens=0,
+        cache_creation_tokens=written,
         cache_read_tokens=cached,
         cost_usd=None,
         project=project,
@@ -351,36 +362,29 @@ def _append_pricing_segment(
     data: dict,
     info: dict,
     segments: list[UsageSegment],
-    seen_totals: set[tuple[int, int, int]],
+    seen_totals: set[tuple[int, int, int, int]],
 ) -> None:
     """Codex token_count 会重复发同一累计快照；按 total 去重后保留每轮 last_token_usage。"""
     total = info.get("total_token_usage")
     last = info.get("last_token_usage")
     if not isinstance(total, dict) or not isinstance(last, dict):
         return
-    signature = (
-        total.get("input_tokens", 0),
-        total.get("cached_input_tokens", 0),
-        total.get("output_tokens", 0),
-    )
-    if signature in seen_totals:
+    signature = _usage_tokens(total)
+    if signature is None or signature in seen_totals:
         return
     timestamp = _parse_timestamp(data.get("timestamp"))
     if timestamp is None:
         return
-    cached = last.get("cached_input_tokens", 0)
-    total_in = last.get("input_tokens", 0)
-    output = last.get("output_tokens", 0)
-    if not all(isinstance(v, int) and v >= 0 for v in (cached, total_in, output)):
+    counts = _usage_tokens(last)
+    if counts is None or not any(counts):
         return
-    uncached = max(0, total_in - cached)
-    if not (uncached or cached or output):
-        return
+    uncached, output, written, cached = counts
     seen_totals.add(signature)
     segments.append(UsageSegment(
         timestamp=timestamp,
         input_tokens=uncached,
         output_tokens=output,
+        cache_creation_tokens=written,
         cache_read_tokens=cached,
     ))
 

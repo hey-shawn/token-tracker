@@ -5,6 +5,8 @@
 
 ## 当前阶段
 
+**2026-09-09 17:52 GPT-6 Astra / Claude Fable 5.1 适配已完成（未发版）**：新增 Astra 标准内置价与 >272K 输入阶梯价，离线／旧缓存不再缺价；Fable 5.1 缓存读取按 $0.25/MTok，保留 Fable 5 / Mythos 5 的 $1/MTok 历史价，更新 Fable 系列兜底并补两款显示名。Codex 从累计和逐请求用量读取 `cache_write_input_tokens`，由普通输入扣除后独立计价，总 token 数不变；状态栏回退共用拆分逻辑，`STATUSLINE_HOOK_VERSION` 升至 1.9。完整与英文 dumb terminal 测试各 395 项通过，Ruff / mypy / diff 检查通过；官方依据与计价边界见 `docs/agent-handbook.md` 的「模型识别 / 定价约定」。
+
 **代码性能优化已完成（2026-08-31 20:08，未发版）**：daily/monthly 日期键移除高频 `strftime`，16,508 条 Kimi 真实数据聚合从约 0.71s/0.68s 降至 0.033s/0.027s；Codex 状态栏改由 adapter 单次扫描同时产出元数据、限额和逐请求计价 entry，200MB 真实会话从原 2～3 遍约 0.56～0.84s 收敛为单遍 0.31s，`STATUSLINE_HOOK_VERSION` 升至 1.8；`tt sessions` 从 24h 开始渐进扫描最近仍有写入的完整会话，以第 N 条 start 与窗口边界证明结果完整，候选不足才扩大直至全量，本机 Claude/Codex/Kimi 共约 6.5GB 历史的默认 20 条路径由全量 10.46s 降至 0.80s，且前 20 条 session id 逐项一致；Kimi 安装检测改看配置根目录，裸安装未产生 sessions 时也能进入 setup。完整 pytest 与英文 dumb terminal CI 模拟均 **367 全绿**，Ruff 全过、mypy 41 个源文件 0 报错，`git diff --check` 通过。
 
 **模型定价全面校准已完成（2026-08-30 10:55，未发版）**：按最新官方页更新 GPT-5.6 Sol 促销价与三档 >272K 阶梯价、Claude Mythos 5、GLM-5.1、Qwen3-Coder-Next、Doubao Seed 2.0 Code／2.1 Pro、DeepSeek V4 峰谷价、Grok 4.3／4.5／4.6 与 Build 长上下文价，并补 Gemini 3.6／3.7、GLM-5.3 等短名；Sonnet 5 的 $2/$10 已确认转为永久价，移除 9 月切价待办。模型解析新增官方 provider 前缀映射，解决 LiteLLM 仅有 `xai/`、`zai/` 等键时 bare model id 误落旧系列价。计价器现按单次请求 prompt 长度选阶梯档；Codex adapter 从 `last_token_usage` 保留逐请求时间与用量，使 DeepSeek 能按请求所在时段结算--周一至周五 UTC 01:00-04:00、06:00-10:00 为峰时，其余时段（含周末全天）为谷时，新价自 2026-08-16 16:00 UTC 生效。Codex 状态栏同步改为逐请求计价并升至 1.7。完整 pytest 与英文 dumb terminal CI 模拟均 **362 全绿**，Ruff 全过、mypy 41 个源文件 0 报错，`git diff --check` 通过。
@@ -136,6 +138,7 @@
 
 ## 待办 / 计划
 
+- **Codex 非标准服务档计价（待确认日志字段）**：Astra 官方 Fast 为适用标准价的 2 倍，Flex 为 0.5 倍；当前抽查的 3 个真实 Astra 会话无可核实的 `service_tier`，继续按标准价估算。后续以逐请求实际生效档位为准，不从当前用户配置或模型名推断整段历史的倍率。
 - **`tt sidebar` 点击跳转补 Ghostty（未启动）**：自动分屏已支持 Ghostty（2026-08-03），但总览「点头行跳窗格」仍只有 tmux（`TMUX_PANE` 映射）/ iTerm2（`ITERM_SESSION_ID` 映射）——三套 statusline 模板只采集这两类，`ui/sidebar_app._jump_argvs` 也只认这两类，Ghostty 会话头行当前不可点。Ghostty 无 per-pane 环境变量，statusline 渲染期不宜调 osascript（300ms 预算）；可行路径是点击时懒算：AppleScript `every terminal whose working directory is <会话 cwd>` 匹配后 `focus`（多窗格同项目时有歧义，需定优先级，如取 front window 首个匹配），或推动 Ghostty 暴露 surface id 环境变量后再走精确映射。README 对点击跳转的「iTerm2 / tmux」描述在补齐前保持现状（是准确描述，非遗漏）。
 - **自动 1/3 分屏跟随原会话退出（独立后续，未实现）**：不监听 `/quit` 文本，改由 `$tt-sidebar` launcher 沿父进程树定位原生 Codex PID 并传给 split；macOS 用 `kqueue` `EVFILT_PROC + NOTE_EXIT`、Linux 用 `pidfd` 阻塞等待真实进程退出，收到事件后退出 Textual 并关闭配对 pane。该路径应覆盖 `/quit`、`/exit`、崩溃和原 pane 关闭，不增加 transcript / SQLite 监听或周期 timer；iTerm2 `jobName` 变量监听只作终端专属备用，shell wrapper 需改变启动方式，均不作为主实现。Claude Code 继续优先使用官方 `SessionEnd`，强杀再走同类进程兜底。
 - **GitHub issue / PR 状态重新核对**：本地确认 #16 / #17 / #19 对应功能已经落地；外部 open/closed 状态在实际处理前重新查询，不沿用 2026-07-04 的旧快照。
@@ -154,6 +157,8 @@
 - 纯 osascript 无法在 iTerm2 原生全屏下调整 pane 列宽；当前安全回滚并提示退出全屏，若以后要求原生全屏 1/3，需重新评估 Python API fallback 或 macOS Accessibility 方案。
 
 ## 最近验证
+
+- **2026-09-09 17:52**：**Astra / Fable 5.1 定价与 Codex 缓存写入适配**。完整 pytest 与 `LANG=C LC_ALL=C TERM=dumb` 各 **395 passed**（新增 28 项参数化回归），Ruff 全过、mypy 41 个源文件无错误、`git diff --check` 通过。覆盖旧缓存／断网、272K 边界、日期后缀、历史价隔离、按请求而非会话累计套档、缺失／非法缓存写入和状态栏回退。两款内置模型的全部价格字段与实时 LiteLLM 表一致；3 个真实 Astra 会话总 token 与原始日志一致、逐请求分段完整；样本缓存写入均为 0，非零写入以合成日志验证。英文测试首次受 uv 用户缓存沙箱限制，获准扩大权限后重跑通过，未修改用户配置。Fable 5.1 未做真实会话端到端验证。
 
 - **2026-08-31 20:08**：**代码性能优化与 Kimi 裸安装检测修复完成**。真实数据基准：16,508 条 Kimi daily/monthly 聚合约 0.71s/0.68s → 0.033s/0.027s；200MB Codex 当前会话状态栏解析由 2～3 遍收敛为单遍 0.31s；三 Agent 默认 `tt sessions 20` 在约 6.5GB 历史下由全量 10.46s 降至 0.80s，前 20 条 session id 逐项一致，并补近期窗口完整会话、长会话扩窗、候选不足全量回退、状态栏单扫描和 Kimi 根目录检测回归。完整 pytest **367 全绿**、英文 dumb terminal CI 模拟 **367 全绿**、Ruff 全过、mypy 41 个源文件 0 报错、`git diff --check` 通过。
 
@@ -192,7 +197,3 @@
 - **2026-07-28**：**版本升至 0.4.12 并完成 GitHub / PyPI 发布与远端回验**。`pyproject.toml` / `uv.lock` 已同步 0.4.12，发布 commit `3945ca6` 与 annotated tag `v0.4.12` 均已 push。完整 pytest **272 全绿**、Ruff 全过、mypy 38 个源文件 0 报错，`uv lock --check` 与 `git diff --check` 通过。由干净发布提交构建的 sdist / wheel 通过 Twine check，wheel 确认包含 `skills/tt_sidebar_kimi/`，METADATA 版本 / Python ≥3.11 / 三项运行依赖正确。PyPI JSON 已传播，远端 wheel SHA-256 `618708cb…159d`、sdist SHA-256 `ae31f729…ca62` 与本地产物完全一致；`uvx --no-cache` 从 PyPI 安装后 `tt --version` 正确输出 0.4.12。
 
 - **2026-07-24 12:25**：**Kimi Code sidebar 适配完成并真机端到端验证（已随 0.4.12 发布）**（commit `78f91ba`）。实证先行：临时在真实 `~/.kimi-code/config.toml` 挂 debug hook 抓到 `UserPromptSubmit` 载荷（`prompt` 为 content parts 数组、含 `session_id`/`cwd`、无 `model`/`turn_id`，抓完即还原配置）；`env` 确认 Kimi 会话内无 session id 变量。真机验证：`tt sidebar --once` 总览正确出现本会话（`token-tracker · Kimi · Kimi K3 · 运行中` + 提示词 + 「下一步」）；`/skill:tt-sidebar` 经新 launcher 在 iTerm2 右侧打开 1/3 分屏（cwd 回退定位到 `session_41c56b88…` 正确）；烘焙的 prompt-hook 命令手动喂载荷退出 0；临时 `KIMI_CODE_HOME` 下 `_setup_kimi_sidebar` / `_unsetup_kimi_sidebar` roundtrip（skill + config.toml 托管块装/卸、`needs_update` 状态迁移）全过。完整 pytest **272 收集 / 270 通过**（`test_render_prompt_wraps_two_lines_with_ellipsis` / `test_render_hint_wraps_to_three_lines_then_ellipsis` 在干净 HEAD worktree 同样失败，确认是环境相关历史遗留，未顺手改）、Ruff 全过、mypy 38 个源文件 0 报错。注意：真机自动重引导（SETUP_VERSION 3→4）已把真实 CC/Codex/Kimi 配置烘焙为仓库 `.venv` 解释器（editable），发版升级后重跑 `tt setup` 会自愈为安装版解释器。
-
-- **2026-07-22 10:19**：**版本升至 0.4.11 并完成 GitHub / PyPI 发布与远端回验**。`pyproject.toml` / `uv.lock` 已同步 0.4.11，源码分支与 annotated tag `v0.4.11` 均已 push；发布提交触发的 GitHub Actions 中 Python 3.11 / 3.12 全绿。完整 pytest **258 全绿**、Ruff 全过、mypy 38 个源文件 0 报错，`uv lock --check` 与 `git diff --check` 通过。由干净发布提交构建的 sdist / wheel 通过 Twine check，元数据与包内容确认版本、Python ≥3.11、三项运行依赖及新版 `$tt-sidebar` Skill 均正确。PyPI JSON 与 Simple 索引已传播，远端 wheel SHA-256 `abf1a22e…df1c`、sdist SHA-256 `ae28e77a…a82` 与本地产物完全一致；独立缓存从 PyPI 安装后 `tt --version` 正确输出 0.4.11。构建只有既有 setuptools license 弃用警告，不影响产物。
-- **2026-07-22 09:40**：**根治 `$tt-sidebar` 在 Codex 沙箱内误报 AppleScript `-2741`**。用已安装 0.4.10 的原始静态脚本对照验证：普通沙箱编译返回 `Expected end of line... (-2741)`，同时出现系统脚本服务连接被阻断；同一脚本以沙箱外权限纯编译返回 0。修复发行 Skill 的执行权限约束，并为 `-2741` 增加沙箱字典不可见的可操作提示；tmux 权限不变，README 同步首次双授权流程。Skill 官方 validator 通过；定向 **17** 个测试、完整 pytest **258 全绿**，Ruff 全过、mypy 38 个源文件 0 报错、`git diff --check` 通过。未修改真实用户 Skill；项目级旧原型分屏已单独真机执行成功，修复已随 0.4.11 发布。
-- **2026-07-21 10:09**：**修复 GitHub Actions 在英文 Runner 上稳定失败的两个 sidebar 用例**。CI 日志确认 Python 3.11 / 3.12 同因失败：产品正确输出英文，但测试写死中文空态和时区名称；0.4.10 的前两次 push 也已失败，和本次 weekly limit 改动无关。测试现通过 i18n 获取当前语言预期，空态文案对窄栏自动换行做空白归一化。中文 / 英文两个定向用例各自通过；允许 `ps` 进程探活的英文隔离环境完整 pytest **257 全绿**，Ruff 全过、mypy 38 个源文件 0 报错。
