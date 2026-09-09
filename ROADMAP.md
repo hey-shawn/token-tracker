@@ -5,6 +5,8 @@
 
 ## 当前阶段
 
+**2026-09-10 00:09 GPT 模型命名空间识别已修复（未发版）**：`chatgpt/gpt-5.6-sol` 原先无法匹配已有定价并按 $0 计；现支持 `chatgpt/gpt-*`、`openai/gpt-*` 缺少独立报价时复用裸模型解析，日期后缀和长上下文阶梯价保持一致。完整 ID 及其变体报价优先，完整 ID 精确价也优先于已缓存的裸模型兜底；未知第三方、嵌套前缀和非 GPT 模型不剥除。完整与英文 dumb terminal pytest 各 **416 passed**，Ruff、mypy 和 diff 检查通过。
+
 **2026-09-09 19:55 `0.5.7` 已发布 PyPI（源码与 tag 已 push）**：包含 Astra / Fable 5.1 定价、Codex 缓存写入计价、此前模型价格校准与扫描性能优化。发布 commit `30a7892`、annotated tag `v0.5.7` 已推送；完整 pytest 与英文 dumb terminal 各 **395 passed**，Ruff、mypy（41 个源文件）、锁文件和 diff 检查通过。从提交快照构建 sdist / wheel，Twine check 通过，wheel 的 44 个包文件与提交逐项一致。PyPI 元数据和实际下载产物的 SHA-256 均与本地一致（wheel `3f4b6d14…3d4a`、sdist `09294a28…452a`）；官方索引无缓存隔离安装后 `tt --version` 正确输出 0.5.7。用户级工具仍为旧安装，未自动升级；原有规范迁移改动和品牌素材保持未提交。
 
 **2026-09-09 17:52 GPT-6 Astra / Claude Fable 5.1 适配已随 0.5.7 发布**：新增 Astra 标准内置价与 >272K 输入阶梯价，离线／旧缓存不再缺价；Fable 5.1 缓存读取按 $0.25/MTok，保留 Fable 5 / Mythos 5 的 $1/MTok 历史价，更新 Fable 系列兜底并补两款显示名。Codex 从累计和逐请求用量读取 `cache_write_input_tokens`，由普通输入扣除后独立计价，总 token 数不变；状态栏回退共用拆分逻辑，`STATUSLINE_HOOK_VERSION` 升至 1.9。完整与英文 dumb terminal 测试各 395 项通过，Ruff / mypy / diff 检查通过；官方依据与计价边界见 `docs/agent-handbook.md` 的「模型识别 / 定价约定」。
@@ -160,6 +162,8 @@
 
 ## 最近验证
 
+- **2026-09-10 00:09**：**GPT 命名空间定价修复**。先复现 `chatgpt/`、`openai/` 前缀导致定价归零，再补最小解析规则；新增 21 项回归覆盖两个前缀、Sol / Astra、日期后缀、272K 上下界、完整 ID 报价优先、缓存兜底后新增精确价，以及未知／嵌套／空前缀边界。完整 pytest 和英文 dumb terminal 各 416 passed，Ruff 全过、mypy 41 个源文件无错误、`git diff --check` 通过。只读加载本机现有价格缓存，确认 `chatgpt/gpt-5.6-sol` 命中 `gpt-5.6-sol`；未修改用户级安装或缓存。
+
 - **2026-09-09 19:55**：**0.5.7 打包、发布与远端回验完成**。版本与锁文件一致；完整测试和英文 dumb terminal 各 395 passed，Ruff / mypy / `uv lock --check` / diff 检查通过。sdist / wheel 经 Twine 校验，包文件与发布提交一致，未混入本地品牌素材或临时文件；远端 main 和 tag 目标已核对。PyPI 两份产物元数据及下载字节的 SHA-256 与本地一致；`uvx --no-cache --index-url https://pypi.org/simple --from token-tracker==0.5.7 tt --version` 返回 0.5.7。构建仅有既存 setuptools license 弃用提示；GitHub CI workflow 为 active，但截至检查时未查询到本次发布提交的 Actions 运行记录，不将其标为远端 CI 通过。
 
 - **2026-09-09 17:52**：**Astra / Fable 5.1 定价与 Codex 缓存写入适配**。完整 pytest 与 `LANG=C LC_ALL=C TERM=dumb` 各 **395 passed**（新增 28 项参数化回归），Ruff 全过、mypy 41 个源文件无错误、`git diff --check` 通过。覆盖旧缓存／断网、272K 边界、日期后缀、历史价隔离、按请求而非会话累计套档、缺失／非法缓存写入和状态栏回退。两款内置模型的全部价格字段与实时 LiteLLM 表一致；3 个真实 Astra 会话总 token 与原始日志一致、逐请求分段完整；样本缓存写入均为 0，非零写入以合成日志验证。英文测试首次受 uv 用户缓存沙箱限制，获准扩大权限后重跑通过，未修改用户配置。Fable 5.1 未做真实会话端到端验证。
@@ -197,5 +201,3 @@
 - **2026-08-01 05:05**：**`docs/statusline-fields.md` 补齐 Codex 伪 statusline 数据字段节（文档，未改实现）**。用本机真实 deepseek 会话（2026-07-31，codex 0.146.0，`model_provider: "deepseek"`，`deepseek-v4-flash` / `deepseek-v4-pro`）实测字段，并对照 openai/codex `hooks/src/schema.rs` 的 `StopCommandInput` 官方定义：Stop hook stdin 共 9 个字段（`session_id` / `turn_id` / `transcript_path` / `cwd` / `hook_event_name` / `model` / `permission_mode` / `stop_hook_active` / `last_assistant_message`，无 token / cost / 额度，需回读 jsonl）；会话 jsonl 的 `session_meta`（含 `model_provider`）、`turn_context`（`model` / `effort` 跟随换模型）、`token_count`（`total_token_usage` / `last_token_usage` 六项 + `model_context_window=996147` + `rate_limits`）均可解析。deepseek 差异明确：`rate_limits.primary/secondary` 为 `null` 无 5h/7d、无官方 cost 字段（靠 `cost.py` 内置价估算）、有 `cached_input_tokens` / `cache_write_input_tokens` 缓存字段。文档结构对齐 CC / Kimi 两节。
 
 - **2026-07-31**：**版本升至 0.5.0 并完成 GitHub / PyPI 发布与远端回验**。`pyproject.toml` / `uv.lock` 已同步 0.5.0，发布 commit `d0c1e77` 与 annotated tag `v0.5.0` 均已 push。完整 pytest **312 全绿**、Ruff 全过、mypy 40 个源文件 0 报错，`uv lock --check` 与 `git diff --check` 通过。由干净发布提交构建的 sdist / wheel 通过 Twine check，wheel 确认包含 `adapters/kimi.py` / `templates/kimi_statusline.py` / `skills/tt_sidebar_kimi/`，METADATA 版本 / 描述 / 三项运行依赖正确。PyPI JSON 已传播，远端 wheel SHA-256 `7baa7e57…0978`、sdist SHA-256 `fafdbe25…792c` 与本地产物完全一致；`uvx --no-cache` 从 PyPI 安装后 `tt --version` 正确输出 0.5.0。
-
-- **2026-07-28**：**版本升至 0.4.12 并完成 GitHub / PyPI 发布与远端回验**。`pyproject.toml` / `uv.lock` 已同步 0.4.12，发布 commit `3945ca6` 与 annotated tag `v0.4.12` 均已 push。完整 pytest **272 全绿**、Ruff 全过、mypy 38 个源文件 0 报错，`uv lock --check` 与 `git diff --check` 通过。由干净发布提交构建的 sdist / wheel 通过 Twine check，wheel 确认包含 `skills/tt_sidebar_kimi/`，METADATA 版本 / Python ≥3.11 / 三项运行依赖正确。PyPI JSON 已传播，远端 wheel SHA-256 `618708cb…159d`、sdist SHA-256 `ae31f729…ca62` 与本地产物完全一致；`uvx --no-cache` 从 PyPI 安装后 `tt --version` 正确输出 0.4.12。

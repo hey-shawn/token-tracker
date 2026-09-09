@@ -244,6 +244,51 @@ def test_new_models_short_names_and_astra_prefix_boundary():
     assert cost._resolve_model_key("gpt-60-astra", pricing) is None
 
 
+@pytest.mark.parametrize("namespace", ["chatgpt", "openai"])
+@pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-5.6-sol-20260901", "gpt-6-astra"])
+@pytest.mark.parametrize("prompt_tokens", [272_000, 272_001])
+def test_openai_namespaced_models_keep_base_pricing(monkeypatch, capsys, namespace, model, prompt_tokens):
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    monkeypatch.setattr(cost, "_model_key_cache", {})
+    monkeypatch.setattr(cost, "_warned_unknown_models", set())
+    usage = dict(
+        input_tokens=prompt_tokens - 30_000, output_tokens=2_000,
+        cache_creation_tokens=10_000, cache_read_tokens=20_000,
+    )
+    expected = cost.calculate_cost(make_entry(model=model, **usage))
+    assert expected > 0
+    assert cost.calculate_cost(make_entry(model=f"{namespace}/{model}", **usage)) == pytest.approx(expected)
+    assert capsys.readouterr().err == ""
+
+
+def test_namespaced_exact_price_overrides_cached_base_resolution(monkeypatch):
+    pricing = cost._fallback_pricing()
+    model = "chatgpt/gpt-5.6-sol"
+    monkeypatch.setattr(cost, "_pricing", pricing)
+    monkeypatch.setattr(cost, "_model_key_cache", {})
+    entry = make_entry(model=model, input_tokens=1_000)
+    assert cost.calculate_cost(entry) == pytest.approx(0.004)
+    pricing[model] = {"input_cost_per_token": 9e-6}
+    assert cost.calculate_cost(entry) == pytest.approx(0.009)
+
+
+def test_namespaced_dated_price_precedes_bare_price(monkeypatch):
+    pricing = cost._fallback_pricing()
+    pricing["chatgpt/gpt-5.6-sol"] = {"input_cost_per_token": 9e-6}
+    monkeypatch.setattr(cost, "_pricing", pricing)
+    monkeypatch.setattr(cost, "_model_key_cache", {})
+    entry = make_entry(model="chatgpt/gpt-5.6-sol-20260901", input_tokens=1_000)
+    assert cost.calculate_cost(entry) == pytest.approx(0.009)
+
+
+@pytest.mark.parametrize("model", [
+    "third-party/gpt-5.6-sol", "chatgpt-pro/gpt-5.6-sol", "chatgpt/deepseek-v4-flash",
+    "chatgpt/openai/gpt-5.6-sol", "chatgpt/", "chatgpt/gpt-6-astral", "",
+])
+def test_namespace_fallback_does_not_strip_unknown_or_nested_prefixes(model):
+    assert cost._resolve_model_key_uncached(model, cost._fallback_pricing()) is None
+
+
 def test_opus5_falls_back_to_opus_family_pricing(monkeypatch):
     # Opus 5 与 Opus 4.8 同价（$5/$25），老系列新版本靠家族兜底即可，无需专属内置价
     monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())

@@ -227,6 +227,9 @@ def _deepseek_pricing(model: str, timestamp: datetime) -> dict:
 def _resolve_model_key(model: str, pricing: dict) -> str | None:
     if not model:
         return None
+    # 完整 ID 的专属价始终优先，不能被此前缓存的裸模型兜底遮蔽。
+    if model in pricing:
+        return model
     if model in _model_key_cache:
         cached = _model_key_cache[model]
         if cached is not None and cached in pricing:
@@ -254,6 +257,12 @@ def _resolve_model_key_uncached(model: str, pricing: dict) -> str | None:
     suffix_keys = [k for k in pricing if k.lower().startswith(ml + "-")]
     if suffix_keys:
         return min(suffix_keys, key=len)
+
+    # 已知 OpenAI 命名空间缺少独立报价时，沿用裸 GPT 模型的精确／日期／系列解析。
+    # 只剥一层已知前缀；第三方平台或嵌套 provider 不擅自套用官方价。
+    namespace, _, bare_model = ml.partition("/")
+    if namespace in ("chatgpt", "openai") and bare_model.startswith("gpt-") and "/" not in bare_model:
+        return _resolve_model_key_uncached(bare_model, pricing)
 
     # 官方 provider 前缀补全：例如 bare `grok-4.6` → LiteLLM 的 `xai/grok-4.6`。
     for model_prefix, providers in _OFFICIAL_PROVIDER_PREFIXES:
