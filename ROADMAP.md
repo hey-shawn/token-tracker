@@ -5,6 +5,8 @@
 
 ## 当前阶段
 
+**2026-09-09 19:52 `0.5.7` 发布进行中**：版本与锁文件已同步；包含 Astra / Fable 5.1 定价、Codex 缓存写入计价、此前模型价格校准与扫描性能优化。发布前完整 pytest 与英文 dumb terminal 各 **395 passed**，Ruff、mypy（41 个源文件）、锁文件和 diff 检查通过。待完成提交快照构建、tag / push、PyPI 上传及远端安装回验；原有规范迁移改动和品牌素材不纳入本次发布。
+
 **2026-09-09 17:52 GPT-6 Astra / Claude Fable 5.1 适配已完成（未发版）**：新增 Astra 标准内置价与 >272K 输入阶梯价，离线／旧缓存不再缺价；Fable 5.1 缓存读取按 $0.25/MTok，保留 Fable 5 / Mythos 5 的 $1/MTok 历史价，更新 Fable 系列兜底并补两款显示名。Codex 从累计和逐请求用量读取 `cache_write_input_tokens`，由普通输入扣除后独立计价，总 token 数不变；状态栏回退共用拆分逻辑，`STATUSLINE_HOOK_VERSION` 升至 1.9。完整与英文 dumb terminal 测试各 395 项通过，Ruff / mypy / diff 检查通过；官方依据与计价边界见 `docs/agent-handbook.md` 的「模型识别 / 定价约定」。
 
 **代码性能优化已完成（2026-08-31 20:08，未发版）**：daily/monthly 日期键移除高频 `strftime`，16,508 条 Kimi 真实数据聚合从约 0.71s/0.68s 降至 0.033s/0.027s；Codex 状态栏改由 adapter 单次扫描同时产出元数据、限额和逐请求计价 entry，200MB 真实会话从原 2～3 遍约 0.56～0.84s 收敛为单遍 0.31s，`STATUSLINE_HOOK_VERSION` 升至 1.8；`tt sessions` 从 24h 开始渐进扫描最近仍有写入的完整会话，以第 N 条 start 与窗口边界证明结果完整，候选不足才扩大直至全量，本机 Claude/Codex/Kimi 共约 6.5GB 历史的默认 20 条路径由全量 10.46s 降至 0.80s，且前 20 条 session id 逐项一致；Kimi 安装检测改看配置根目录，裸安装未产生 sessions 时也能进入 setup。完整 pytest 与英文 dumb terminal CI 模拟均 **367 全绿**，Ruff 全过、mypy 41 个源文件 0 报错，`git diff --check` 通过。

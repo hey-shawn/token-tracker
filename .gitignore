@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 .venv/
+.tmp/
 
 # 测试覆盖率产物
 .coverage
