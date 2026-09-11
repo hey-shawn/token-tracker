@@ -17,7 +17,7 @@ Custom StatusLine integration + CLI Dashboard — see token usage, cost, and rat
 - **Live sidebar** — `tt sidebar` shows all active sessions (Claude Code + Codex + Kimi Code); `$tt-sidebar` in Codex or `/skill:tt-sidebar` in Kimi Code opens a current-session-only pane on the right at one-third width
 - **Rate limit monitoring** — real-time 5h / 7d quota usage with reset countdown
 - **Multi-dimensional cost analysis** — per-session, daily, weekly, monthly cost breakdown
-- **Pricing resolution** — litellm live pricing + built-in official-price fallback, covering Claude / OpenAI / Gemini / Grok and major Chinese models (Kimi / GLM / Qwen / Doubao / DeepSeek / MiniMax / MiMo); new family members auto-priced, never silently $0
+- **Pricing resolution** -- litellm live pricing + built-in official-price fallback, including GPT-6 Astra, Claude Fable 5.1, Claude / OpenAI / Gemini / Grok and major Chinese models (Kimi / GLM / Qwen / Doubao / DeepSeek / MiniMax / MiMo); long-context tiers and DeepSeek peak/off-peak rates (weekends are fully off-peak) are calculated per request, with separate Codex cache-read and cache-write pricing. Unknown models use known family rates where available; unresolved models emit a missing-price warning
 - **Session insights** — project, model, duration, message count per session
 - **Unified multi-theme** — 6 themes (Catppuccin family + Nord + Dracula) shared across CLI reports and every agent's status line; switch with `tt theme`
 - **Zero config** — auto-detects installed agents, reads local data directly
@@ -65,7 +65,7 @@ Codex doesn't yet support custom StatusLine. Token Tracker injects a **faux stat
 
 **Two-line layout**:
 
-- **L1** `[project](branch +A -D) | Total: <session tokens> | Model: <model reasoning>` — Total in orange, Model in red; third-party API providers (e.g. DeepSeek) have no subscription quota, so L1 also shows session Cost (estimated with built-in official rates)
+- **L1** `[project](branch +A -D) | Total: <session tokens> | Model: <model reasoning>` — Total in orange, Model in red; third-party API providers (e.g. DeepSeek) have no subscription quota, so L1 also shows session Cost (estimated from built-in official rates using each request's timestamp and context tier)
 - **L2** `Limit: 5h <bar> % (reset <ttl>) | 7d <bar> % (reset <ttl>) | <window> Ctx <bar> %` — quota is read from the current session / same model_provider, so multiple accounts and providers never cross-contaminate; the `Limit:` prefix is hidden when no quota data exists
 
 Renders 24-bit truecolor, **does not enter the model context** (verified), and **follows the current theme** (same source as the CLI reports / CC status line; `tt theme` switches all three together). `tt unsetup` removes it.

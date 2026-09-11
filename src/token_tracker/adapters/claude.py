@@ -19,22 +19,31 @@ def detect() -> AgentInfo | None:
 
 
 def load_entries(hours_back: int = 0) -> list[UsageEntry]:
-    entries: list[UsageEntry] = []
-    seen: set[str] = set()
     cutoff = None
     if hours_back > 0:
         from datetime import timedelta
         cutoff = datetime.now(UTC) - timedelta(hours=hours_back)
+    return _load_entries(cutoff, cutoff)
+
+
+def load_recent_entries(cutoff: datetime) -> list[UsageEntry]:
+    """读取 cutoff 后仍有写入的完整会话，供 `tt sessions` 渐进查找最近 N 条。"""
+    return _load_entries(cutoff, None)
+
+
+def _load_entries(file_cutoff: datetime | None, entry_cutoff: datetime | None) -> list[UsageEntry]:
+    entries: list[UsageEntry] = []
+    seen: set[str] = set()
 
     for base_dir in _get_claude_dirs():
         base = Path(base_dir)
         if not base.is_dir():
             continue
         for jsonl_path in base.rglob("*.jsonl"):
-            if not file_may_have_events_since(jsonl_path, cutoff):
+            if not file_may_have_events_since(jsonl_path, file_cutoff):
                 continue
             fallback_project = _extract_project_from_dir(jsonl_path, base)
-            _parse_jsonl(jsonl_path, fallback_project, entries, seen, cutoff)
+            _parse_jsonl(jsonl_path, fallback_project, entries, seen, entry_cutoff)
 
     entries.sort(key=lambda e: e.timestamp)
     return entries

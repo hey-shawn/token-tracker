@@ -1,7 +1,7 @@
 import os
 import sys
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 
 from rich.text import Text
 
@@ -57,6 +57,10 @@ SORT_ATTRS = {
     "output": "output_tokens",
 }
 VALID_SORT_KEYS = (*SORT_ATTRS.keys(), "time")
+
+# sessions 只展示最近 N 条：先扫近期仍有写入的完整会话，候选不足或边界无法证明完整时逐步扩大，
+# 最后才回退全量。窗口内文件使用完整会话解析，不会把长会话截成一段后误改 start_time。
+_SESSION_LOOKBACK_HOURS = (24, 7 * 24, 30 * 24, 180 * 24, 365 * 24)
 
 
 # 数据报表命令分发表：命令 → (聚合函数, 渲染函数, time 排序的属性, 无 --sort 时的默认属性, 默认降序)
@@ -167,6 +171,18 @@ def _load_per_agent(agents) -> list[tuple]:
     return [(a, _load_entries(a.id)) for a in agents]
 
 
+def _load_per_agent_since(agents, cutoff: datetime) -> list[tuple]:
+    loaded = []
+    for agent in agents:
+        loader = AGENT_LOADERS.get(agent.id)
+        if loader is None:
+            continue
+        recent_loader = getattr(loader, "load_recent_entries", None)
+        entries = recent_loader(cutoff) if recent_loader else loader.load_entries()
+        loaded.append((agent, entries))
+    return loaded
+
+
 def _aggregate_per_agent(loaded, agg_fn):
     stats = []
     for a, entries in loaded:
@@ -174,6 +190,24 @@ def _aggregate_per_agent(loaded, agg_fn):
             s.agent_id = a.id
             stats.append(s)
     return stats
+
+
+def _load_recent_session_stats(agents, limit: int):
+    """渐进加载最近会话；只有能证明未扫描文件不可能进入前 limit 名时才提前停止。"""
+    now = datetime.now(UTC)
+    for hours in _SESSION_LOOKBACK_HOURS:
+        cutoff = now - timedelta(hours=hours)
+        stats = _aggregate_per_agent(_load_per_agent_since(agents, cutoff), aggregate_sessions)
+        eligible = sorted(
+            (session for session in stats if session.active_minutes >= 5),
+            key=lambda session: session.start_time,
+            reverse=True,
+        )
+        # 未扫描文件的 mtime < cutoff，而 session start <= 文件 mtime；当第 N 条 start >= cutoff 时，
+        # 未扫描文件必然更老，结果与全量扫描一致。长会话 start < cutoff 时继续扩大窗口。
+        if len(eligible) >= limit and eligible[limit - 1].start_time >= cutoff:
+            return stats
+    return _aggregate_per_agent(_load_per_agent(agents), aggregate_sessions)
 
 
 def _build_status_data(agents) -> dict | None:
@@ -504,15 +538,21 @@ def _run_report_command(command: str, args: list[str], agents, filter_agent: str
     selected = _report_agents(agents, command, filter_agent)
     agent_names = [agent.name for agent in selected]
     agg_fn, render_fn, time_attr, no_sort_attr, default_reverse = _REPORT_COMMANDS[command]
-    loaded = _load_per_agent(selected)
-    stats = _aggregate_per_agent(loaded, agg_fn)
     default_attr = time_attr if sort_key == "time" else no_sort_attr
 
     if command == "sessions":
-        _render_session_report(stats, rest_args, sort_key, sort_desc,
-                               default_attr, default_reverse, agent_names)
+        try:
+            limit = _parse_limit(rest_args, default=20)
+        except ValueError as exc:
+            get_console().print(f"[red]{t('sessions_limit_invalid', value=exc.args[0])}[/red]")
+            sys.exit(1)
+        stats = _load_recent_session_stats(selected, limit)
+        _render_session_report(stats, sort_key, sort_desc,
+                               default_attr, default_reverse, agent_names, limit)
         return
 
+    loaded = _load_per_agent(selected)
+    stats = _aggregate_per_agent(loaded, agg_fn)
     assert render_fn is not None  # sessions（render_fn=None）已在上面 return，其余命令都有渲染函数
     _apply_sort(stats, sort_key, sort_desc, default_attr, default_reverse)
     if command == "daily":
@@ -527,17 +567,12 @@ def _run_report_command(command: str, args: list[str], agents, filter_agent: str
                        weekly=_aggregate_per_agent(loaded, aggregate_weekly))
 
 
-def _render_session_report(stats, rest_args: list[str], sort_key: str | None,
+def _render_session_report(stats, sort_key: str | None,
                            sort_desc: bool | None, default_attr: str,
-                           default_reverse: bool, agent_names: list[str]) -> None:
+                           default_reverse: bool, agent_names: list[str], limit: int) -> None:
     # 先按时间取最近 N 条，再按用户指定字段展示；避免历史高 cost 会话长期霸榜。
     kept = [session for session in stats if session.active_minutes >= 5]
     kept.sort(key=lambda session: session.start_time, reverse=True)
-    try:
-        limit = _parse_limit(rest_args, default=20)
-    except ValueError as exc:
-        get_console().print(f"[red]{t('sessions_limit_invalid', value=exc.args[0])}[/red]")
-        sys.exit(1)
     shown = kept[:limit]
     _apply_sort(shown, sort_key, sort_desc, default_attr, default_reverse)
     render_sessions_view(_summary_from_sessions(shown), shown, agent_names)

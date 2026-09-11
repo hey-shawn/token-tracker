@@ -1,6 +1,9 @@
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from token_tracker.adapters import codex
 
@@ -61,8 +64,6 @@ def test_session_end_recorded_from_last_event(tmp_path):
 
 def test_codex_single_entry_yields_real_duration():
     # 回归：codex 每会话仅 1 条 entry，靠 session_end 让 aggregate_sessions 算出真实跨度（旧版恒为 0）
-    from datetime import UTC, datetime
-
     from token_tracker.adapters.types import UsageEntry
     from token_tracker.analyzer.aggregator import aggregate_sessions
     e = UsageEntry(
@@ -192,6 +193,120 @@ def test_reasoning_tokens_not_double_counted(tmp_path):
     assert entries[0].input_tokens == 18406 - 9216
     assert entries[0].output_tokens == 1054  # 不含 reasoning 803
     assert entries[0].cache_read_tokens == 9216
+
+
+def test_pricing_segments_preserve_each_request_and_skip_duplicate_snapshots(tmp_path):
+    events = [
+        {"timestamp": "2026-08-22T00:00:00.000Z", "type": "session_meta",
+         "payload": {"id": "s1", "timestamp": "2026-08-22T00:00:00.000Z", "cwd": "/tmp/proj"}},
+        {"timestamp": "2026-08-22T01:00:00.000Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10},
+                "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10},
+            },
+        }},
+        {"timestamp": "2026-08-22T01:00:01.000Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10},
+                "last_token_usage": {"input_tokens": 100, "cached_input_tokens": 20, "output_tokens": 10},
+            },
+        }},
+        {"timestamp": "2026-08-22T06:00:00.000Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 250, "cached_input_tokens": 70, "output_tokens": 30},
+                "last_token_usage": {"input_tokens": 150, "cached_input_tokens": 50, "output_tokens": 20},
+            },
+        }},
+    ]
+    path = _write_session(tmp_path, events)
+    entries: list = []
+    codex._parse_jsonl(path, {"s1": "deepseek-v4-flash"}, entries, set(), None)
+
+    assert len(entries) == 1
+    entry = entries[0]
+    assert (entry.input_tokens, entry.cache_read_tokens, entry.output_tokens) == (180, 70, 30)
+    assert len(entry.pricing_segments) == 2
+    assert (
+        entry.pricing_segments[0].input_tokens,
+        entry.pricing_segments[0].cache_read_tokens,
+        entry.pricing_segments[0].output_tokens,
+    ) == (80, 20, 10)
+    assert entry.pricing_segments[1].timestamp == datetime(2026, 8, 22, 6, tzinfo=UTC)
+
+
+def test_session_snapshot_collects_statusline_data_in_one_scan(tmp_path, monkeypatch):
+    rl = {
+        "primary": {"used_percent": 12.0, "window_minutes": 300, "resets_at": 9_999_999_999},
+        "secondary": {"used_percent": 60.0, "window_minutes": 10080, "resets_at": 9_999_999_999},
+    }
+    path = _write_session(tmp_path, [
+        _meta_event("deepseek", session_id="snapshot-s1"),
+        {"timestamp": "2026-06-04T19:30:00.000Z", "type": "turn_context",
+         "payload": {"model": "deepseek-v4-flash", "effort": "high"}},
+        _token_count_event(rl, timestamp="2026-06-04T20:00:00.000Z"),
+    ])
+    original = codex.iter_jsonl_dicts
+    scans = 0
+
+    def counted(path_arg):
+        nonlocal scans
+        scans += 1
+        yield from original(path_arg)
+
+    monkeypatch.setattr(codex, "iter_jsonl_dicts", counted)
+    snapshot = codex.load_session_snapshot(path)
+
+    assert scans == 1
+    assert snapshot.session_id == "snapshot-s1"
+    assert snapshot.provider == "deepseek"
+    assert snapshot.model == "deepseek-v4-flash"
+    assert snapshot.effort == "high"
+    assert snapshot.rate_limits is not None and snapshot.rate_limits.five_hour_pct == 12.0
+    assert snapshot.usage_entry is not None and snapshot.usage_entry.model == "deepseek-v4-flash"
+
+
+@pytest.mark.parametrize("written", [0, 30_000, 80_000])
+def test_astra_cache_writes_are_separate_and_totals_unchanged(tmp_path, monkeypatch, written):
+    from token_tracker.analyzer import cost
+
+    usage = {
+        "input_tokens": 100_000, "cached_input_tokens": 20_000,
+        "cache_write_input_tokens": written, "output_tokens": 2_000,
+        "reasoning_output_tokens": 1_000, "total_tokens": 102_000,
+    }
+    event = _token_count_event({})
+    event["payload"]["info"].update(total_token_usage=usage, last_token_usage=usage)
+    path = _write_session(tmp_path, [
+        _meta_event("openai"),
+        {"type": "turn_context", "payload": {"model": "gpt-6-astra", "effort": "max"}},
+        event, event,
+    ])
+    entry = codex.load_session_snapshot(path).usage_entry
+    assert entry is not None
+    assert entry.model == "gpt-6-astra"
+    assert entry.total_tokens == 102_000
+    assert entry.input_tokens == 80_000 - written
+    assert entry.cache_creation_tokens == written
+    assert entry.cache_read_tokens == 20_000
+    assert entry.output_tokens == 2_000
+    assert len(entry.pricing_segments) == 1
+    assert entry.pricing_segments[0].cache_creation_tokens == written
+    assert entry.pricing_segments[0].prompt_tokens == 100_000
+    assert cost._segments_cover_entry(entry)
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    assert cost.calculate_cost(entry) == pytest.approx(0.92 + written * 2.5e-6)
+
+
+@pytest.mark.parametrize("written", [-1, "30", None, True, 81])
+def test_invalid_codex_cache_write_counts_are_rejected(tmp_path, written):
+    usage = {
+        "input_tokens": 100, "cached_input_tokens": 20,
+        "cache_write_input_tokens": written, "output_tokens": 1,
+    }
+    event = _token_count_event({})
+    event["payload"]["info"].update(total_token_usage=usage, last_token_usage=usage)
+    path = _write_session(tmp_path, [_meta_event("openai"), event])
+    assert codex.load_session_snapshot(path).usage_entry is None
 
 
 def test_load_rate_limits_uses_newest_standard_event_across_sessions(tmp_path, monkeypatch):

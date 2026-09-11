@@ -15,6 +15,21 @@ def normalize_pct(pct: float | None, resets_at: int | float | None, now_ts: floa
 
 
 @dataclass
+class UsageSegment:
+    """单次请求用量；供聚合型 adapter 保留峰谷时间与长上下文计价所需粒度。"""
+
+    timestamp: datetime
+    input_tokens: int
+    output_tokens: int
+    cache_creation_tokens: int = 0
+    cache_read_tokens: int = 0
+
+    @property
+    def prompt_tokens(self) -> int:
+        return self.input_tokens + self.cache_creation_tokens + self.cache_read_tokens
+
+
+@dataclass
 class UsageEntry:
     timestamp: datetime
     session_id: str
@@ -31,6 +46,8 @@ class UsageEntry:
     message_count: int = 1
     # 仅 codex：单条 entry 即整段会话，记录会话结束时间，让 aggregate_sessions 能算真实跨度（claude 留 None 走多条 entry）
     session_end: datetime | None = None
+    # Codex 的 UsageEntry 是会话累计值；保留每轮请求用量后，成本仍可按请求时间与上下文档位精确计算。
+    pricing_segments: tuple[UsageSegment, ...] = ()
 
     @property
     def total_tokens(self) -> int:

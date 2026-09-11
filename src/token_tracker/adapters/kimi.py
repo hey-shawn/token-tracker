@@ -24,8 +24,8 @@ SESSIONS_DIR = os.path.join(KIMI_DIR, "sessions")
 
 
 def detect() -> AgentInfo | None:
-    # 以 sessions 目录判断（与 sidebar 纳入口径一致；没跑过会话的裸安装不产生数据）
-    if Path(SESSIONS_DIR).is_dir():
+    # 以 Kimi 配置根目录判断是否安装；不能要求 sessions/ 已产生，否则裸安装用户无法进入 setup。
+    if Path(KIMI_DIR).is_dir():
         return AgentInfo(id="kimi", name="Kimi Code")
     return None
 
@@ -73,20 +73,29 @@ def _state_updated_at(raw: object) -> datetime | None:
 
 
 def load_entries(hours_back: int = 0) -> list[UsageEntry]:
-    entries: list[UsageEntry] = []
-    seen: set[str] = set()
     cutoff = None
     if hours_back > 0:
         cutoff = datetime.now(UTC) - timedelta(hours=hours_back)
+    return _load_entries(cutoff, cutoff)
+
+
+def load_recent_entries(cutoff: datetime) -> list[UsageEntry]:
+    """读取 cutoff 后仍有写入的完整会话，供 `tt sessions` 渐进查找最近 N 条。"""
+    return _load_entries(cutoff, None)
+
+
+def _load_entries(file_cutoff: datetime | None, entry_cutoff: datetime | None) -> list[UsageEntry]:
+    entries: list[UsageEntry] = []
+    seen: set[str] = set()
 
     sessions_path = Path(SESSIONS_DIR)
     if not sessions_path.is_dir():
         return entries
 
     for wire_path in sessions_path.glob("*/*/agents/main/wire.jsonl"):
-        if not file_may_have_events_since(wire_path, cutoff):
+        if not file_may_have_events_since(wire_path, file_cutoff):
             continue
-        _parse_wire(wire_path, entries, seen, cutoff)
+        _parse_wire(wire_path, entries, seen, entry_cutoff)
 
     entries.sort(key=lambda e: e.timestamp)
     return entries

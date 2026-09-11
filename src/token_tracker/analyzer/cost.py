@@ -5,10 +5,11 @@ import ssl
 import sys
 import time
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import URLError
 
-from ..adapters.types import UsageEntry
+from ..adapters.types import UsageEntry, UsageSegment
 
 LITELLM_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 # 缓存放用户可写目录：包根目录在 site-packages 下是只读的，写失败会导致每次都联网
@@ -26,7 +27,8 @@ _FAMILY_FALLBACK = (
     ("claude-opus", "claude-opus-4-8"),
     ("claude-sonnet", "claude-sonnet-5"),
     ("claude-haiku", "claude-haiku-4-5-20251001"),
-    ("claude-fable", "claude-fable-5"),
+    ("claude-fable", "claude-fable-5-1"),
+    ("claude-mythos", "claude-mythos-5"),
     # GPT-5.6 三档并列（sol/terra/luna 各自有内置价，dated/variant 靠前缀命中）；系列内
     # 未知新档（如假想 gpt-5.6-nova）退回旗舰 sol——新档价未知时退回最贵档，宁可高估不低估
     ("gpt-5.6", "gpt-5.6-sol"),
@@ -36,6 +38,7 @@ _FAMILY_FALLBACK = (
     ("kimi-code/k3", "kimi-k3"),
     ("kimi", "kimi-k2.6"),
     ("moonshot-v", "moonshot-v1-128k"),
+    ("glm-5", "glm-5.1"),
     ("glm-4", "glm-4.6"),
     ("qwen3-coder", "qwen3-coder-plus"),
     ("qwen3-max", "qwen-max"),
@@ -49,6 +52,25 @@ _FAMILY_FALLBACK = (
     ("grok-4", "grok-4.3"),
     ("grok", "grok-4.3"),
 )
+
+# LiteLLM 新模型常只有 provider/model 键，Agent 日志则只记 bare model id。
+# 只对厂商官方 provider 做定向补全，避免同模型在第三方平台的加价项被误当成官方价。
+_OFFICIAL_PROVIDER_PREFIXES = (
+    ("grok-", ("xai/",)),
+    ("glm-", ("zai/",)),
+    ("qwen", ("dashscope/",)),
+    ("kimi-", ("moonshot/",)),
+    ("minimax-", ("minimax/",)),
+)
+
+_DEEPSEEK_NEW_PRICING_AT = datetime(2026, 8, 16, 16, 0, tzinfo=UTC)
+_DEEPSEEK_V4_PRICING_KEYS = {
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash-vision-exp",
+    "deepseek-chat",
+    "deepseek-reasoner",
+}
 
 # 解析不到定价的模型只提示一次，避免聚合时每条 entry 刷屏
 _warned_unknown_models: set[str] = set()
@@ -78,25 +100,139 @@ def calculate_cost(entry: UsageEntry) -> float:
         return 0.0
 
     info = pricing[model_key]
-    input_cost = info.get("input_cost_per_token", 0)
-    output_cost = info.get("output_cost_per_token", 0)
-    cache_creation_cost = info.get("cache_creation_input_token_cost", input_cost * 1.25)
-    cache_read_cost = info.get("cache_read_input_token_cost", input_cost * 0.1)
+    if entry.pricing_segments and _segments_cover_entry(entry):
+        return sum(
+            _calculate_segment(entry.model, model_key, info, segment)
+            for segment in entry.pricing_segments
+        )
+
+    # Claude / Kimi 的 entry 本身就是单次请求，可直接按 prompt 长度选阶梯价。
+    # Codex 是会话累计值；旧日志没有逐轮 segment 时不能拿会话总量冒充单次上下文，只按基础档安全降级。
+    prompt_tokens = None if entry.agent_id == "codex" else (
+        entry.input_tokens + entry.cache_creation_tokens + entry.cache_read_tokens
+    )
+    return _calculate_tokens(
+        entry.model,
+        model_key,
+        info,
+        entry.timestamp,
+        entry.input_tokens,
+        entry.output_tokens,
+        entry.cache_creation_tokens,
+        entry.cache_read_tokens,
+        prompt_tokens,
+    )
+
+
+def _segments_cover_entry(entry: UsageEntry) -> bool:
+    """只有逐轮数据完整覆盖会话累计值时才采用，旧版/缺字段日志继续走安全降级。"""
+    return (
+        sum(s.input_tokens for s in entry.pricing_segments) == entry.input_tokens
+        and sum(s.output_tokens for s in entry.pricing_segments) == entry.output_tokens
+        and sum(s.cache_creation_tokens for s in entry.pricing_segments) == entry.cache_creation_tokens
+        and sum(s.cache_read_tokens for s in entry.pricing_segments) == entry.cache_read_tokens
+    )
+
+
+def _calculate_segment(model: str, model_key: str, info: dict, segment: UsageSegment) -> float:
+    return _calculate_tokens(
+        model,
+        model_key,
+        info,
+        segment.timestamp,
+        segment.input_tokens,
+        segment.output_tokens,
+        segment.cache_creation_tokens,
+        segment.cache_read_tokens,
+        segment.prompt_tokens,
+    )
+
+
+def _calculate_tokens(
+    model: str,
+    model_key: str,
+    info: dict,
+    timestamp: datetime,
+    input_tokens: int,
+    output_tokens: int,
+    cache_creation_tokens: int,
+    cache_read_tokens: int,
+    prompt_tokens: int | None,
+) -> float:
+    if model_key.lower() in _DEEPSEEK_V4_PRICING_KEYS:
+        info = _deepseek_pricing(model, timestamp)
+
+    suffix = _context_price_suffix(info, prompt_tokens)
+    input_cost = _tier_value(info, "input_cost_per_token", suffix, 0)
+    output_cost = _tier_value(info, "output_cost_per_token", suffix, 0)
+    cache_creation_cost = _tier_value(
+        info, "cache_creation_input_token_cost", suffix, input_cost * 1.25
+    )
+    cache_read_cost = _tier_value(info, "cache_read_input_token_cost", suffix, input_cost * 0.1)
 
     return (
-        entry.input_tokens * input_cost
-        + entry.output_tokens * output_cost
-        + entry.cache_creation_tokens * cache_creation_cost
-        + entry.cache_read_tokens * cache_read_cost
+        input_tokens * input_cost
+        + output_tokens * output_cost
+        + cache_creation_tokens * cache_creation_cost
+        + cache_read_tokens * cache_read_cost
     )
+
+
+def _context_price_suffix(info: dict, prompt_tokens: int | None) -> str:
+    if prompt_tokens is None:
+        return ""
+    thresholds: list[int] = []
+    prefix = "input_cost_per_token_above_"
+    suffix = "k_tokens"
+    for key in info:
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        raw = key[len(prefix):-len(suffix)]
+        if raw.isdigit():
+            thresholds.append(int(raw))
+    inclusive = info.get("long_context_threshold_inclusive", False)
+    eligible = [
+        threshold
+        for threshold in thresholds
+        if (prompt_tokens >= threshold * 1000 if inclusive else prompt_tokens > threshold * 1000)
+    ]
+    return f"_above_{max(eligible)}k_tokens" if eligible else ""
+
+
+def _tier_value(info: dict, key: str, suffix: str, default: float) -> float:
+    if suffix and f"{key}{suffix}" in info:
+        return info[f"{key}{suffix}"]
+    return info.get(key, default)
+
+
+def _deepseek_pricing(model: str, timestamp: datetime) -> dict:
+    """DeepSeek 官方直营价：新价生效后仅工作日 UTC 两段为峰值，周末全天谷价。"""
+    ts = timestamp if timestamp.tzinfo is not None else timestamp.replace(tzinfo=UTC)
+    ts = ts.astimezone(UTC)
+    pro = model.lower().startswith("deepseek-v4-pro")
+    if ts < _DEEPSEEK_NEW_PRICING_AT:
+        info = _cny(3, 6, 0.025) if pro else _cny(1, 2, 0.02)
+        info["cache_creation_input_token_cost"] = info["input_cost_per_token"]
+        return info
+
+    peak = ts.weekday() < 5 and (1 <= ts.hour < 4 or 6 <= ts.hour < 10)
+    if pro:
+        info = _cny(9, 27, 0.3) if peak else _cny(4.5, 13.5, 0.15)
+    else:
+        info = _cny(3, 9, 0.1) if peak else _cny(1.5, 4.5, 0.05)
+    info["cache_creation_input_token_cost"] = info["input_cost_per_token"]
+    return info
 
 
 def _resolve_model_key(model: str, pricing: dict) -> str | None:
     if not model:
         return None
+    # 完整 ID 的专属价始终优先，不能被此前缓存的裸模型兜底遮蔽。
+    if model in pricing:
+        return model
     if model in _model_key_cache:
         cached = _model_key_cache[model]
-        if cached is None or cached in pricing:
+        if cached is not None and cached in pricing:
             return cached
     key = _resolve_model_key_uncached(model, pricing)
     _model_key_cache[model] = key
@@ -121,6 +257,22 @@ def _resolve_model_key_uncached(model: str, pricing: dict) -> str | None:
     suffix_keys = [k for k in pricing if k.lower().startswith(ml + "-")]
     if suffix_keys:
         return min(suffix_keys, key=len)
+
+    # 已知 OpenAI 命名空间缺少独立报价时，沿用裸 GPT 模型的精确／日期／系列解析。
+    # 只剥一层已知前缀；第三方平台或嵌套 provider 不擅自套用官方价。
+    namespace, _, bare_model = ml.partition("/")
+    if namespace in ("chatgpt", "openai") and bare_model.startswith("gpt-") and "/" not in bare_model:
+        return _resolve_model_key_uncached(bare_model, pricing)
+
+    # 官方 provider 前缀补全：例如 bare `grok-4.6` → LiteLLM 的 `xai/grok-4.6`。
+    for model_prefix, providers in _OFFICIAL_PROVIDER_PREFIXES:
+        if not ml.startswith(model_prefix):
+            continue
+        for provider in providers:
+            target = provider + ml
+            for key in pricing:
+                if key.lower() == target:
+                    return key
 
     # 同系列兜底：未知的新 Claude 模型（litellm 收录滞后）退回同系列最新已知价，避免成本静默归零
     for prefix, fallback_key in _FAMILY_FALLBACK:
@@ -261,13 +413,16 @@ def _usd(input_m: float, output_m: float, cache_read_m: float | None = None) -> 
 
 def _fallback_pricing() -> dict:
     return {
+        # https://platform.claude.com/docs/en/models/fable-5-1/overview
+        # Fable 5.1 仅缓存读取降至 $0.25/MTok；旧 Fable 5 / Mythos 5 保留原价。
+        "claude-fable-5-1": {**_FABLE_PRICING, "cache_read_input_token_cost": 0.25e-6},
         "claude-fable-5": _FABLE_PRICING,
+        "claude-mythos-5": _FABLE_PRICING,
         "claude-opus-4-8": _OPUS_PRICING,
         "claude-opus-4-7": _OPUS_PRICING,
         "claude-opus-4-6": _OPUS_PRICING,
         "claude-opus-4-5": _OPUS_PRICING,
-        # Sonnet 5 当前为导入价（$2 / $10 / $2.50 cache-write / $0.20 cache-read），截止 2026-08-31；
-        # 9-1 起标准价 $3 / $15（与 Sonnet 4.6 一致）。到期后需切价（注意：litellm 若已收录、以在线价为准）。
+        # Sonnet 5 的 $2/$10 导入价已于 2026-08-10 由 Anthropic 宣布转为永久价。
         "claude-sonnet-5": {
             "input_cost_per_token": 2e-6,
             "output_cost_per_token": 10e-6,
@@ -286,6 +441,18 @@ def _fallback_pricing() -> dict:
             "cache_creation_input_token_cost": 1.25e-6,
             "cache_read_input_token_cost": 0.1e-6,
         },
+        # https://developers.openai.com/api/docs/models/gpt-6-astra
+        # Standard：超过 272K 输入，整次请求 input/cache 2x、output 1.5x。
+        "gpt-6-astra": {
+            "input_cost_per_token": 10e-6,
+            "output_cost_per_token": 50e-6,
+            "cache_creation_input_token_cost": 12.5e-6,
+            "cache_read_input_token_cost": 1e-6,
+            "input_cost_per_token_above_272k_tokens": 20e-6,
+            "output_cost_per_token_above_272k_tokens": 75e-6,
+            "cache_creation_input_token_cost_above_272k_tokens": 25e-6,
+            "cache_read_input_token_cost_above_272k_tokens": 2e-6,
+        },
         "gpt-5": {
             "input_cost_per_token": 1.25e-6,
             "output_cost_per_token": 10e-6,
@@ -296,23 +463,37 @@ def _fallback_pricing() -> dict:
             "output_cost_per_token": 30e-6,
             "cache_read_input_token_cost": 0.5e-6,
         },
-        # GPT-5.6 系列（2026-07-09 GA，litellm 收录前必须有专属内置价——gpt-5.6-* 会被
-        # gpt-5 前缀吞掉错价）。取短上下文基础档；7-30 官方调价后：Terra 降 20%、Luna 降 80%。
-        #  cached input 均为 input 的 10%；长上下文表（Sol $10/$45 等）本表不跟踪。
+        # GPT-5.6 系列：短上下文基础档；超过 272K 输入后整次请求按 2x input / 1.5x output。
+        # Sol 当前 $4/$20 为至少持续到 2026-11-21 的促销价。
         "gpt-5.6-sol": {
-            "input_cost_per_token": 5e-6,
-            "output_cost_per_token": 30e-6,
-            "cache_read_input_token_cost": 0.5e-6,
+            "input_cost_per_token": 4e-6,
+            "output_cost_per_token": 20e-6,
+            "cache_creation_input_token_cost": 5e-6,
+            "cache_read_input_token_cost": 0.4e-6,
+            "input_cost_per_token_above_272k_tokens": 8e-6,
+            "output_cost_per_token_above_272k_tokens": 30e-6,
+            "cache_creation_input_token_cost_above_272k_tokens": 10e-6,
+            "cache_read_input_token_cost_above_272k_tokens": 0.8e-6,
         },
         "gpt-5.6-terra": {
             "input_cost_per_token": 2e-6,
             "output_cost_per_token": 12e-6,
+            "cache_creation_input_token_cost": 2.5e-6,
             "cache_read_input_token_cost": 0.2e-6,
+            "input_cost_per_token_above_272k_tokens": 4e-6,
+            "output_cost_per_token_above_272k_tokens": 18e-6,
+            "cache_creation_input_token_cost_above_272k_tokens": 5e-6,
+            "cache_read_input_token_cost_above_272k_tokens": 0.4e-6,
         },
         "gpt-5.6-luna": {
             "input_cost_per_token": 0.2e-6,
             "output_cost_per_token": 1.2e-6,
+            "cache_creation_input_token_cost": 0.25e-6,
             "cache_read_input_token_cost": 0.02e-6,
+            "input_cost_per_token_above_272k_tokens": 0.4e-6,
+            "output_cost_per_token_above_272k_tokens": 1.8e-6,
+            "cache_creation_input_token_cost_above_272k_tokens": 0.5e-6,
+            "cache_read_input_token_cost_above_272k_tokens": 0.04e-6,
         },
         "gpt-5-codex": {
             "input_cost_per_token": 1.25e-6,
@@ -356,23 +537,40 @@ def _fallback_pricing() -> dict:
         "glm-4.5-air": _usd(0.2, 1.1, 0.03),
         "glm-4.7": _usd(0.6, 2.2, 0.11),
         "glm-5": _usd(1.0, 3.2, 0.2),
+        "glm-5.1": _usd(1.4, 4.4, 0.26),
         # 阿里 Qwen（中国站百炼人民币价，0-32K 基础档）
         "qwen3-coder-plus": _cny(4, 16, 0.4),
+        "qwen3-coder-next": {
+            **_cny(1, 4),
+            "input_cost_per_token_above_32k_tokens": 1.5 / _CNY_PER_USD * 1e-6,
+            "output_cost_per_token_above_32k_tokens": 6 / _CNY_PER_USD * 1e-6,
+            "input_cost_per_token_above_128k_tokens": 2.5 / _CNY_PER_USD * 1e-6,
+            "output_cost_per_token_above_128k_tokens": 10 / _CNY_PER_USD * 1e-6,
+        },
         "qwen-max": _cny(2.5, 10),
         "qwen-plus": _cny(0.8, 2),
         # 火山方舟 Doubao（中国站人民币价，0-32K 基础档）
         "doubao-seed-1-6": _cny(0.8, 8),
         "doubao-seed-code": _cny(1.2, 8),
+        "doubao-seed-2.0-code": {
+            **_cny(3.2, 16, 0.64),
+            "input_cost_per_token_above_32k_tokens": 4.8 / _CNY_PER_USD * 1e-6,
+            "output_cost_per_token_above_32k_tokens": 24 / _CNY_PER_USD * 1e-6,
+            "cache_read_input_token_cost_above_32k_tokens": 0.96 / _CNY_PER_USD * 1e-6,
+            "input_cost_per_token_above_128k_tokens": 9.6 / _CNY_PER_USD * 1e-6,
+            "output_cost_per_token_above_128k_tokens": 48 / _CNY_PER_USD * 1e-6,
+            "cache_read_input_token_cost_above_128k_tokens": 1.92 / _CNY_PER_USD * 1e-6,
+        },
+        "doubao-seed-2.1-pro": _cny(6, 30, 1.2),
         "doubao-1-5-pro-32k": _cny(0.8, 2, 0.16),
         "doubao-1-5-pro-256k": _cny(5, 9),
-        # DeepSeek（官方中国站人民币价；chat/reasoner 现映射 V4-Flash，2026-07-24 弃用旧名）
-        # 注意：官方已预告峰谷定价（高峰=北京时间 9:00-12:00 / 14:00-18:00 全计费项 ×2），
-        # 2026-07-31 核实尚未生效（"具体时间以正式通知为准"）；生效后需按 entry 时间戳分时段计价，
-        # 并同步状态栏 _session_cost 的口径
-        "deepseek-v4-flash": _cny(1, 2, 0.02),
-        "deepseek-v4-pro": _cny(3, 6, 0.025),
-        "deepseek-chat": _cny(1, 2, 0.02),
-        "deepseek-reasoner": _cny(1, 2, 0.02),
+        # DeepSeek：表内放新价高峰档作静态元数据；calculate_cost 按生效时间、工作日与峰谷时段动态覆盖。
+        # 周一至周五北京时间 9:00-12:00 / 14:00-18:00 为高峰，周末全天与其余时段均为谷价。
+        "deepseek-v4-flash": _cny(3, 9, 0.1),
+        "deepseek-v4-pro": _cny(9, 27, 0.3),
+        "deepseek-v4-flash-vision-exp": _cny(3, 9, 0.1),
+        "deepseek-chat": _cny(3, 9, 0.1),
+        "deepseek-reasoner": _cny(3, 9, 0.1),
         # MiniMax（官方 USD，与中国站÷7 自洽；M2/M2.1/M2.5 同价 legacy）
         "MiniMax-M2": _usd(0.3, 1.2, 0.03),
         "MiniMax-M2.1": _usd(0.3, 1.2, 0.03),
@@ -383,8 +581,40 @@ def _fallback_pricing() -> dict:
         "mimo-v2.5-pro": _cny(3, 6, 0.025),
         "mimo-v2.5": _cny(1, 2, 0.02),
         # xAI Grok（docs.x.ai 官方 USD）。2026-05-15 退役潮：grok-4-fast/4.1-fast/grok-3 路由到 grok-4.3，
-        # grok-code-fast-1 退役为 grok-build-0.1 别名（退役 slug 靠 _FAMILY_FALLBACK 接住）。grok-4.3 取 ≤200K 默认档。
-        "grok-4.3": _usd(1.25, 2.5, 0.2),
-        "grok-build-0.1": _usd(1.0, 2.0, 0.2),
-        "grok-code-fast-1": _usd(1.0, 2.0, 0.2),
+        # grok-code-fast-1 退役为 grok-build-0.1 别名（退役 slug 靠 _FAMILY_FALLBACK 接住）。
+        "grok-4.3": {
+            **_usd(1.25, 2.5, 0.2),
+            "long_context_threshold_inclusive": True,
+            "input_cost_per_token_above_200k_tokens": 2.5e-6,
+            "output_cost_per_token_above_200k_tokens": 5e-6,
+            "cache_read_input_token_cost_above_200k_tokens": 0.4e-6,
+        },
+        "grok-build-0.1": {
+            **_usd(1.0, 2.0, 0.2),
+            "long_context_threshold_inclusive": True,
+            "input_cost_per_token_above_200k_tokens": 2e-6,
+            "output_cost_per_token_above_200k_tokens": 4e-6,
+            "cache_read_input_token_cost_above_200k_tokens": 0.4e-6,
+        },
+        "grok-code-fast-1": {
+            **_usd(1.0, 2.0, 0.2),
+            "long_context_threshold_inclusive": True,
+            "input_cost_per_token_above_200k_tokens": 2e-6,
+            "output_cost_per_token_above_200k_tokens": 4e-6,
+            "cache_read_input_token_cost_above_200k_tokens": 0.4e-6,
+        },
+        "grok-4.5": {
+            **_usd(2.0, 6.0, 0.3),
+            "long_context_threshold_inclusive": True,
+            "input_cost_per_token_above_200k_tokens": 4e-6,
+            "output_cost_per_token_above_200k_tokens": 12e-6,
+            "cache_read_input_token_cost_above_200k_tokens": 0.6e-6,
+        },
+        "grok-4.6": {
+            **_usd(2.0, 6.0, 0.5),
+            "long_context_threshold_inclusive": True,
+            "input_cost_per_token_above_200k_tokens": 4e-6,
+            "output_cost_per_token_above_200k_tokens": 12e-6,
+            "cache_read_input_token_cost_above_200k_tokens": 1e-6,
+        },
     }

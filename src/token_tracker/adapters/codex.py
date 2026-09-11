@@ -1,9 +1,10 @@
 import os
 import sqlite3
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .types import AgentInfo, RateLimits, UsageEntry, normalize_pct
+from .types import AgentInfo, RateLimits, UsageEntry, UsageSegment, normalize_pct
 from .util import codex_home, file_may_have_events_since, iter_jsonl_dicts, project_from_cwd
 
 CODEX_DIR = codex_home()
@@ -21,6 +22,36 @@ _VIRTUAL_MODEL_REWRITE = {
 }
 
 
+@dataclass
+class CodexSessionSnapshot:
+    """单次扫描得到的当前会话快照，供高频 statusline 复用。"""
+
+    session_id: str = ""
+    cwd: str = ""
+    info: dict | None = None
+    model: str = ""
+    effort: str = ""
+    provider: str = ""
+    rate_limits: RateLimits | None = None
+    usage_entry: UsageEntry | None = None
+
+
+@dataclass
+class _SessionData:
+    session_id: str = ""
+    session_ts: str = ""
+    cwd: str = ""
+    provider: str = ""
+    model: str = ""
+    effort: str = ""
+    last_info: dict | None = None
+    msg_count: int = 0
+    session_end: datetime | None = None
+    pricing_segments: list[UsageSegment] = field(default_factory=list)
+    seen_segment_totals: set[tuple[int, int, int, int]] = field(default_factory=set)
+    last_rate_payload: tuple[float, dict, dict, str] | None = None
+
+
 def _rewrite_virtual_model(model: str) -> str:
     return _VIRTUAL_MODEL_REWRITE.get(model, model)
 
@@ -33,11 +64,20 @@ def detect() -> AgentInfo | None:
 
 
 def load_entries(hours_back: int = 0) -> list[UsageEntry]:
-    entries: list[UsageEntry] = []
-    seen: set[str] = set()
     cutoff = None
     if hours_back > 0:
         cutoff = datetime.now(UTC) - timedelta(hours=hours_back)
+    return _load_entries(cutoff, cutoff)
+
+
+def load_recent_entries(cutoff: datetime) -> list[UsageEntry]:
+    """读取 cutoff 后仍有写入的完整会话，供 `tt sessions` 渐进查找最近 N 条。"""
+    return _load_entries(cutoff, None)
+
+
+def _load_entries(file_cutoff: datetime | None, entry_cutoff: datetime | None) -> list[UsageEntry]:
+    entries: list[UsageEntry] = []
+    seen: set[str] = set()
 
     models = _load_thread_models()
 
@@ -46,9 +86,9 @@ def load_entries(hours_back: int = 0) -> list[UsageEntry]:
         return entries
 
     for jsonl_path in sessions_path.rglob("*.jsonl"):
-        if not file_may_have_events_since(jsonl_path, cutoff):
+        if not file_may_have_events_since(jsonl_path, file_cutoff):
             continue
-        _parse_jsonl(jsonl_path, models, entries, seen, cutoff)
+        _parse_jsonl(jsonl_path, models, entries, seen, entry_cutoff)
 
     entries.sort(key=lambda e: e.timestamp)
     return entries
@@ -136,32 +176,15 @@ def _extract_rate_limits(path: Path, models: dict[str, str]) -> RateLimits | Non
 
 
 def _extract_rate_limits_snapshot(path: Path, models: dict[str, str]) -> tuple[float, RateLimits, str] | None:
-    session_id = ""
-    provider = ""
-    last_payload = None
-    for data in iter_jsonl_dicts(path):
-        if data.get("type") == "session_meta":
-            meta = data.get("payload", {})
-            session_id = meta.get("id", "")
-            p = meta.get("model_provider")
-            provider = p if isinstance(p, str) else ""
-        if data.get("type") != "event_msg":
-            continue
-        payload = data.get("payload", {})
-        if payload.get("type") != "token_count":
-            continue
-        rl = payload.get("rate_limits")
-        # Spark 等独立池不是账号总 weekly limit，不能覆盖标准 codex 配额。
-        if not rl or rl.get("limit_id") != _STANDARD_RATE_LIMIT_ID:
-            continue
-        event_ts = _parse_event_timestamp(data.get("timestamp"))
-        if last_payload is None or event_ts >= last_payload[0]:
-            last_payload = (event_ts, rl, payload.get("info") or {}, session_id)
+    data = _read_session_data(path)
+    return _rate_limits_from_data(data, models)
 
-    if not last_payload:
+
+def _rate_limits_from_data(data: _SessionData, models: dict[str, str]) -> tuple[float, RateLimits, str] | None:
+    if not data.last_rate_payload:
         return None
 
-    event_ts, rl, info, sid = last_payload
+    event_ts, rl, info, sid = data.last_rate_payload
 
     now_ts = datetime.now(UTC).timestamp()
     five_pct = five_reset = None
@@ -194,17 +217,8 @@ def _extract_rate_limits_snapshot(path: Path, models: dict[str, str]) -> tuple[f
             plan_type=rl.get("plan_type") or "",
             context_window=info.get("model_context_window"),
         ),
-        provider,
+        data.provider,
     )
-
-
-def _parse_event_timestamp(value: object) -> float:
-    if not isinstance(value, str):
-        return 0.0
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return 0.0
 
 
 def _parse_jsonl(
@@ -214,82 +228,171 @@ def _parse_jsonl(
     seen: set[str],
     cutoff: datetime | None,
 ) -> None:
-    session_id = ""
-    session_ts = ""
-    project = "unknown"
-    model = "unknown"
-    last_usage = None
-    msg_count = 0
-    session_end_ts: datetime | None = None
+    data = _read_session_data(path)
+    entry = _usage_entry_from_data(data, models)
+    if entry is None or (cutoff and entry.timestamp < cutoff) or entry.session_id in seen:
+        return
+    seen.add(entry.session_id)
+    entries.append(entry)
 
+
+def load_session_snapshot(path: Path | str) -> CodexSessionSnapshot:
+    """只扫描一次会话文件，同时生成 statusline 所需元数据、限额与计价 entry。"""
+    data = _read_session_data(Path(path))
+    model = _rewrite_virtual_model(data.model)
+    models = {data.session_id: model} if model else {}
+    rate_snapshot = _rate_limits_from_data(data, models)
+    return CodexSessionSnapshot(
+        session_id=data.session_id,
+        cwd=data.cwd,
+        info=data.last_info,
+        model=model,
+        effort=data.effort,
+        provider=data.provider,
+        rate_limits=rate_snapshot[1] if rate_snapshot else None,
+        usage_entry=_usage_entry_from_data(data, models),
+    )
+
+
+def _read_session_data(path: Path) -> _SessionData:
+    state = _SessionData()
     for data in iter_jsonl_dicts(path):
         row_type = data.get("type")
         # 取所有事件里最大的 timestamp 作会话结束时间（与 session 开始的差 = 真实跨度，供 sessions 报表）
-        ts_raw = data.get("timestamp")
-        if ts_raw:
-            try:
-                et = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-                if session_end_ts is None or et > session_end_ts:
-                    session_end_ts = et
-            except (ValueError, AttributeError):
-                pass
+        event_time = _parse_timestamp(data.get("timestamp"))
+        if event_time is not None and (state.session_end is None or event_time > state.session_end):
+            state.session_end = event_time
+
+        payload = data.get("payload")
+        if not isinstance(payload, dict):
+            continue
 
         if row_type == "session_meta":
-            payload = data.get("payload", {})
-            session_id = payload.get("id", "")
-            session_ts = payload.get("timestamp", "")
-            cwd = payload.get("cwd", "")
-            if cwd:
-                project = project_from_cwd(cwd)
-            model = models.get(session_id, "unknown")
+            state.session_id = payload.get("id", "") or state.session_id
+            state.session_ts = payload.get("timestamp", "") or state.session_ts
+            state.cwd = payload.get("cwd", "") or state.cwd
+            provider = payload.get("model_provider")
+            if isinstance(provider, str) and provider:
+                state.provider = provider
+            continue
+
+        if row_type == "turn_context":
+            model = payload.get("model")
+            effort = payload.get("effort")
+            if isinstance(model, str) and model:
+                state.model = model
+            if isinstance(effort, str) and effort:
+                state.effort = effort
             continue
 
         if row_type != "event_msg":
             continue
 
-        payload = data.get("payload", {})
         if payload.get("type") == "token_count":
             info = payload.get("info")
-            if info and info.get("total_token_usage"):
-                last_usage = info["total_token_usage"]
-                msg_count += 1
+            if isinstance(info, dict) and isinstance(info.get("total_token_usage"), dict):
+                state.last_info = info
+                state.msg_count += 1
+                _append_pricing_segment(data, info, state.pricing_segments, state.seen_segment_totals)
+            rl = payload.get("rate_limits")
+            # Spark 等独立池不是账号总 weekly limit，不能覆盖标准 codex 配额。
+            if isinstance(rl, dict) and rl.get("limit_id") == _STANDARD_RATE_LIMIT_ID:
+                event_ts = event_time.timestamp() if event_time is not None else 0.0
+                if state.last_rate_payload is None or event_ts >= state.last_rate_payload[0]:
+                    state.last_rate_payload = (
+                        event_ts,
+                        rl,
+                        info if isinstance(info, dict) else {},
+                        state.session_id,
+                    )
+    return state
 
-    if not last_usage or not session_id:
-        return
 
-    cached = last_usage.get("cached_input_tokens", 0)
-    input_tokens = last_usage.get("input_tokens", 0) - cached
+def _usage_tokens(usage: dict) -> tuple[int, int, int, int] | None:
+    """Codex input 包含缓存读写；拆为互斥桶，避免重复计数与缓存写入少计价。"""
+    total_in = usage.get("input_tokens", 0)
+    output = usage.get("output_tokens", 0)
+    cached = usage.get("cached_input_tokens", 0)
+    written = usage.get("cache_write_input_tokens", 0)
+    if not all(type(v) is int and v >= 0 for v in (total_in, output, cached, written)):
+        return None
+    if cached + written > total_in:
+        return None
+    return total_in - cached - written, output, written, cached
+
+
+def _usage_entry_from_data(data: _SessionData, models: dict[str, str]) -> UsageEntry | None:
+    last_usage = (data.last_info or {}).get("total_token_usage")
+    if not isinstance(last_usage, dict) or not data.session_id:
+        return None
+
+    counts = _usage_tokens(last_usage)
+    if counts is None or not any(counts):
+        return None
+    input_tokens, output_tokens, written, cached = counts
     # reasoning_output_tokens 是 output_tokens 的子集拆分（实测 total_tokens == input + output），不能再加
-    output_tokens = last_usage.get("output_tokens", 0)
-
-    if input_tokens == 0 and output_tokens == 0:
-        return
 
     try:
-        ts = datetime.fromisoformat(session_ts.replace("Z", "+00:00"))
+        ts = datetime.fromisoformat(data.session_ts.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
-        return
+        return None
 
-    if cutoff and ts < cutoff:
-        return
-
-    if session_id in seen:
-        return
-    seen.add(session_id)
-
-    entries.append(UsageEntry(
+    model = models.get(data.session_id) or _rewrite_virtual_model(data.model) or "unknown"
+    project = project_from_cwd(data.cwd) if data.cwd else "unknown"
+    return UsageEntry(
         timestamp=ts,
-        session_id=session_id,
-        message_id=session_id,
+        session_id=data.session_id,
+        message_id=data.session_id,
         request_id="",
         model=model,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        cache_creation_tokens=0,
+        cache_creation_tokens=written,
         cache_read_tokens=cached,
         cost_usd=None,
         project=project,
         agent_id="codex",
-        message_count=msg_count,
-        session_end=session_end_ts,
+        message_count=data.msg_count,
+        session_end=data.session_end,
+        pricing_segments=tuple(data.pricing_segments),
+    )
+
+
+def _append_pricing_segment(
+    data: dict,
+    info: dict,
+    segments: list[UsageSegment],
+    seen_totals: set[tuple[int, int, int, int]],
+) -> None:
+    """Codex token_count 会重复发同一累计快照；按 total 去重后保留每轮 last_token_usage。"""
+    total = info.get("total_token_usage")
+    last = info.get("last_token_usage")
+    if not isinstance(total, dict) or not isinstance(last, dict):
+        return
+    signature = _usage_tokens(total)
+    if signature is None or signature in seen_totals:
+        return
+    timestamp = _parse_timestamp(data.get("timestamp"))
+    if timestamp is None:
+        return
+    counts = _usage_tokens(last)
+    if counts is None or not any(counts):
+        return
+    uncached, output, written, cached = counts
+    seen_totals.add(signature)
+    segments.append(UsageSegment(
+        timestamp=timestamp,
+        input_tokens=uncached,
+        output_tokens=output,
+        cache_creation_tokens=written,
+        cache_read_tokens=cached,
     ))
+
+
+def _parse_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None

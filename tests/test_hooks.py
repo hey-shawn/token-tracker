@@ -203,6 +203,8 @@ def test_codex_statusline_render_injects_version():
     assert "__STATUSLINE_HOOK_VERSION__" not in rendered
     assert "__STATUSLINE_TRUECOLOR__" not in rendered  # 配色占位符已替换
     assert "'reset'" in rendered and "38;2" in rendered  # 注入了 truecolor 配色 dict（跟随主题）
+    assert ".load_session_rate_limits(" not in rendered
+    assert "codex._parse_jsonl" not in rendered
     compile(rendered, "<codex-statusline>", "exec")
 
 
@@ -248,6 +250,61 @@ def test_codex_statusline_records_terminal_map_without_touching_cc_status(tmp_pa
     assert json.loads(status_path.read_text()) == {
         "session_id": "claude-live", "rate_limits": {"five_hour": 12},
     }
+
+
+def test_codex_statusline_deepseek_cost_uses_each_request_time(tmp_path):
+    script = tmp_path / "codex-statusline.py"
+    script.write_text(hooks._render_codex_statusline_hook(), encoding="utf-8")
+    rollout = tmp_path / "deepseek.jsonl"
+    rows = [
+        {"timestamp": "2026-08-17T00:00:00Z", "type": "session_meta", "payload": {
+            "id": "deepseek-s1", "timestamp": "2026-08-17T00:00:00Z",
+            "cwd": str(tmp_path), "model_provider": "deepseek",
+        }},
+        {"timestamp": "2026-08-17T00:00:01Z", "type": "turn_context", "payload": {
+            "model": "deepseek-v4-flash", "effort": "high",
+        }},
+        {"timestamp": "2026-08-17T01:00:00Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+                "last_token_usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+            },
+        }},
+        {"timestamp": "2026-08-22T01:00:00Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 2_000_000, "output_tokens": 2_000_000},
+                "last_token_usage": {"input_tokens": 1_000_000, "output_tokens": 1_000_000},
+            },
+        }},
+    ]
+    rollout.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    payload = {"transcript_path": str(rollout), "cwd": str(tmp_path)}
+
+    result = subprocess.run(
+        [sys.executable, str(script)], input=json.dumps(payload), text=True,
+        capture_output=True, check=True, env={**os.environ, "HOME": str(tmp_path)},
+    )
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+
+    # 周一峰时 ¥12 + 周六谷时 ¥6，按 7.1 折算后为 $2.54；不能拿当前时段套整段会话。
+    assert "Cost: $2.54" in plain
+
+
+@pytest.mark.parametrize("written, expected", [(None, 0.92), (30_000, 0.995), (-1, None)])
+def test_codex_statusline_fallback_prices_cache_writes(monkeypatch, written, expected):
+    from token_tracker.analyzer import cost
+
+    namespace = {"__name__": "test_codex_statusline"}
+    exec(compile(hooks._render_codex_statusline_hook(), "codex-statusline.py", "exec"), namespace)
+    monkeypatch.setattr(cost, "_pricing", cost._fallback_pricing())
+    usage = {"input_tokens": 100_000, "cached_input_tokens": 20_000, "output_tokens": 2_000}
+    if written is not None:
+        usage["cache_write_input_tokens"] = written
+    actual = namespace["_session_cost"]({"total_token_usage": usage}, "gpt-6-astra")
+    if expected is None:
+        assert actual is None
+    else:
+        assert actual == pytest.approx(expected)
 
 
 def test_codex_statusline_config_migration_preserves_state_and_user_stop(tmp_path, monkeypatch):
